@@ -1,0 +1,6 @@
+# Already present in this environment's system python (3.13): numpy, onnxruntime,
+# mss, opencv-python-headless (cv2), pillow, httpx, mcp. The venv uses
+# --system-site-packages so only the genuinely missing pieces are installed.
+pystray>=0.19
+# Optional OCR upgrade; the daemon falls back to the tesseract binary.
+# rapidocr>=3.10

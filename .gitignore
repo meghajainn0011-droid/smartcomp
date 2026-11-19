@@ -1,0 +1,15 @@
+# Installed venv and build/runtime caches
+.venv/
+__pycache__/
+*.egg-info/
+
+# Optional RapidOCR wheel cache (downloaded by scripts/fetch_rapidocr.sh;
+# tesseract path is the shipped default)
+wheels/
+
+# Session/proof artifacts (screenshots, PNGs) — local only
+artifacts/
+
+# Model binaries — fetched by scripts/fetch_models.sh
+# models/gpa_gui_detector.onnx is 77 MB, over GitHub's 50 MB single-file limit
+models/

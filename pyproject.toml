@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "smartcomp"
+version = "0.1.0"
+description = "Desktop-control MCP daemon: screen perception, input, window management and unattended operation over the X session"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "Damon" }]
+# Heavy runtime deps (numpy, opencv, mss, onnxruntime, pillow, httpx, mcp) are
+# expected in the host python (the venv is created --system-site-packages, see
+# scripts/install.sh); this list carries only what that host python lacks.
+dependencies = ["pystray>=0.19"]
+
+[project.scripts]
+smartcomp = "smartcomp.daemon:main"
+
+[project.optional-dependencies]
+ocr = ["rapidocr>=3.10"]
+
+[tool.setuptools]
+packages = ["smartcomp"]
+include-package-data = false
