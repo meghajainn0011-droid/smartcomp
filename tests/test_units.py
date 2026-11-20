@@ -8,6 +8,7 @@ from __future__ import annotations
 import subprocess
 import os
 import sys
+import tempfile
 import time
 import unittest
 import unittest.mock
@@ -22,6 +23,7 @@ from smartcomp import config  # noqa: E402
 from smartcomp import input as input_mod  # noqa: E402
 from smartcomp import tools as tools_mod  # noqa: E402
 from smartcomp import popups as popups_mod  # noqa: E402
+from smartcomp import sessions as sessions_mod  # noqa: E402
 from smartcomp import vision as vision_mod  # noqa: E402
 from Xlib import XK  # noqa: E402  (keysym ground truth for alias tests)
 from smartcomp import awake as awake_mod  # noqa: E402
@@ -1256,6 +1258,68 @@ class TestCloseWindowReport(unittest.TestCase):
         self.wins.close.return_value = {"ok": False, "error": "no such window"}
         out = self.close_window(window_id="0x9")
         self.assertNotIn("changed", out)
+
+
+class TestSessionManager(unittest.TestCase):
+    """Per-session virtual displays: own cursor, shared training/memory."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="smartcomp-sessions-")
+        self.mgr = sessions_mod.SessionManager.__new__(sessions_mod.SessionManager)
+        self.mgr.root = Path(self.tmp) / "sessions"
+        self.mgr.root.mkdir(parents=True)
+        self.mgr.registry_path = self.mgr.root / "registry.json"
+        self.mgr.shared = unittest.mock.Mock()
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _rec(self, name, display, port):
+        d = self.mgr.root / name
+        d.mkdir(exist_ok=True)
+        return {"display": display, "port": port, "pid": 1, "xvfb_pid": 2,
+                "wm_pid": None, "dir": str(d), "created": 1.0}
+
+    def test_free_display_skips_used_and_host(self):
+        reg = {"sessions": {"a": self._rec("a", ":1000", 8792)}}
+        Path("/tmp/.X11-unix").mkdir(exist_ok=True)
+        used_path = Path("/tmp/.X11-unix/X1001")
+        created = not used_path.exists()
+        if created:
+            used_path.touch()
+        try:
+            self.assertEqual(self.mgr._free_display(reg), ":1002")
+        finally:
+            if created:
+                used_path.unlink()
+
+    def test_registry_round_trip(self):
+        self.mgr._save({"sessions": {"a": self._rec("a", ":1000", 8792)}})
+        self.assertIn("a", self.mgr._load()["sessions"])
+
+    def test_close_removes_session_and_kills_processes(self):
+        self.mgr._save({"sessions": {"a": self._rec("a", ":1000", 8792)}})
+        with unittest.mock.patch.object(sessions_mod.os, "killpg"), \
+             unittest.mock.patch.object(sessions_mod.os, "getpgid", return_value=7):
+            out = self.mgr.close("a")
+        self.assertTrue(out["ok"])
+        self.assertNotIn("a", self.mgr._load()["sessions"])
+
+    def test_align_merges_into_shared_pool(self):
+        rec = self._rec("a", ":1000", 8792)
+        self.mgr._save({"sessions": {"a": rec}})
+        mem = unittest.mock.Mock()
+        mem.skills.return_value = [{"name": "flow", "steps": [{"tool": "click"}],
+                                    "description": "d"}]
+        mem.observations.return_value = [{"key": "k", "value": "v"}]
+        mem.skill.return_value = None
+        self.mgr.shared.skills.return_value = []
+        with unittest.mock.patch.object(self.mgr, "_session_memory", return_value=mem):
+            out = self.mgr.align()
+        self.assertEqual(out["pushed"], 2)
+        self.assertTrue(self.mgr.shared.learn_skill.called)
+        self.assertTrue(self.mgr.shared.remember.called)
 
 
 class TestPopupDetection(unittest.TestCase):

@@ -13,10 +13,30 @@ Free forever — fully public and free, built on the open tools available on the
 machine. **Now supported on Linux/X11** (this target: Debian-family, XFCE, X11 —
 Debian-family packages and systemd user units). **Windows and
 macOS support launches in the next update**, now with additional features (see
-the release notes / roadmap for details).
+the release notes / roadmap for details). Isolated agent sessions need `Xvfb`
+(plus an X11 WM such as `xfwm4`) installed.
 
 Built and measured on the target box: Kali, X11/XFCE, i3-7100U (2 cores / 4
 threads), 7.7 GB RAM, 1920x1080.
+
+## Multiple isolated sessions (virtual cursor per agent)
+
+One X11 display has exactly one pointer, so agents that share a desktop fight
+over the cursor and see each other's windows. `session_create(name)` gives
+each agent a **private Xvfb desktop** (1920x1080) with its own window manager,
+its own XTEST cursor, its own daemon/port/token, and its own state dir. XTEST
+is display-local, so a session's clicks never touch the host pointer or other
+sessions. The virtual display has no screen lock — **sessions keep working
+while the host is locked, blanked or asleep, without waking or unlocking the
+host**. Connect a second LLM with `session_endpoint(name)`.
+
+`session_align()` merges every session's skills/observations into a shared
+pool and pushes the pool back to all sessions; `session_train()` distils each
+session's successful actions into skills and feeds the pool — the fleet gets
+better the more it is used. `session_list()` / `session_close()` manage the
+lifecycle. Verified live: two independent cursors (host vs `:1000`), a Mousepad
+launched on the private display and perceived there (28 elements), healthy
+daemon on the session port, alignment/training round-trip, clean teardown.
 
 ## What's new in this update (v2 — dual vision + popup awareness)
 

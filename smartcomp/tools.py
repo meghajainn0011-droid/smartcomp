@@ -25,6 +25,7 @@ from .input import Input, InputError, MAX_SCROLL_TICKS, launch
 from .memory import Memory
 from .perception import Perception
 from . import popups as popups_mod
+from . import sessions as sessions_mod
 from .vision import decide as _vision_decide, describe as _vision_describe
 from .windows import Windows
 
@@ -1124,6 +1125,46 @@ def register(mcp, perception: Perception, inp: Input, wins: Windows, memory: Mem
                 "in time -- app_status reports the real process count"
             )
         return result
+
+    # -- isolated agent sessions -------------------------------------------
+    @tool
+    def session_create(name: str = "agent") -> dict:
+        """Create a private virtual desktop with its own cursor and daemon.
+
+        Each session gets its own Xvfb display (XTEST cursor), MCP port,
+        token, memory and skills. It keeps working while the host screen is
+        locked/asleep -- nothing here wakes or unlocks the host. Give each
+        agent its own session so they never fight over one pointer. Connect
+        with session_endpoint(name).
+        """
+        return sessions_mod.manager().create(name)
+
+    @tool
+    def session_list() -> dict:
+        """List isolated sessions with display, port and health."""
+        return {"ok": True, "sessions": sessions_mod.manager().list()}
+
+    @tool
+    def session_close(name: str) -> dict:
+        """Stop a session's daemon, WM and virtual display."""
+        return sessions_mod.manager().close(name)
+
+    @tool
+    def session_endpoint(name: str) -> dict:
+        """MCP connect config (url + bearer token) for an isolated session."""
+        return sessions_mod.manager().endpoint(name)
+
+    @tool
+    def session_align() -> dict:
+        """Align memory across sessions: merge every session's skills and
+        observations into the shared pool, then push the pool back to all."""
+        return sessions_mod.manager().align()
+
+    @tool
+    def session_train() -> dict:
+        """Training loop: distil each session's successful actions into a
+        skill, feed the shared pool, then align so every session inherits it."""
+        return sessions_mod.manager().train()
 
     @tool
     def app_status() -> dict:
