@@ -21,6 +21,8 @@ from smartcomp import apps as apps_mod  # noqa: E402
 from smartcomp import config  # noqa: E402
 from smartcomp import input as input_mod  # noqa: E402
 from smartcomp import tools as tools_mod  # noqa: E402
+from smartcomp import popups as popups_mod  # noqa: E402
+from smartcomp import vision as vision_mod  # noqa: E402
 from Xlib import XK  # noqa: E402  (keysym ground truth for alias tests)
 from smartcomp import awake as awake_mod  # noqa: E402
 from smartcomp import input as input_mod  # noqa: E402
@@ -1188,6 +1190,33 @@ class TestDescribeScreen(unittest.TestCase):
         self.assertEqual(out["other_windows_dropped"], 2)
 
 
+    def test_blank_spot_avoids_elements(self):
+        wins = unittest.mock.Mock()
+        wins.list.return_value = [{"id": "w", "active": True,
+                                    "x": 0, "y": 0, "w": 960, "h": 540}]
+        p = unittest.mock.Mock()
+        p.capturer.native_size = (960, 540)
+        p.elements = {"t": {"id": "t", "k": "t", "b": [400, 400, 100, 20],
+                            "x": "button"}}
+        spot = tools_mod._blank_spot(wins, p)
+        self.assertNotEqual(spot, [450, 410])  # not the element's center
+        self.assertTrue(0 <= spot[0] <= 1000 and 0 <= spot[1] <= 1000)
+
+
+    def test_tiny_glyph_snaps_to_overlapping_icon(self):
+        p = unittest.mock.Mock()
+        glyph = {"id": "g", "k": "t", "b": [966, 189, 5, 9], "x": "x"}
+        icon = {"id": "i", "k": "i", "b": [959, 180, 16, 22], "c": 0.44}
+        p.elements = {"g": glyph, "i": icon}
+        self.assertEqual(tools_mod._click_box(p, glyph), icon["b"])
+
+    def test_large_element_unchanged(self):
+        p = unittest.mock.Mock()
+        btn = {"id": "b", "k": "t", "b": [100, 100, 200, 40], "x": "Save"}
+        p.elements = {"b": btn}
+        self.assertEqual(tools_mod._click_box(p, btn), btn["b"])
+
+
 class TestCloseWindowReport(unittest.TestCase):
     """close() is the action whose answer IS the prompt: it arrives in-call."""
 
@@ -1229,6 +1258,96 @@ class TestCloseWindowReport(unittest.TestCase):
         self.assertNotIn("changed", out)
 
 
+class TestPopupDetection(unittest.TestCase):
+    """A popup must surface as a first-class block, never buried in a delta."""
+
+    def setUp(self):
+        self.wins = unittest.mock.Mock()
+        self.perception = unittest.mock.Mock()
+        self.perception.capturer.native_size = (1920, 1080)
+        self.perception.elements = {}
+
+    def test_dialog_window_detected(self):
+        self.wins.list.return_value = [
+            {"id": "0x1", "comm": "brave", "title": "Confirm close all tabs",
+             "x": 700, "y": 300, "w": 500, "h": 200}]
+        self.perception.elements = {}
+        found = popups_mod.detect(self.wins, self.perception)
+        self.assertTrue(any(f["source"] == "window" for f in found))
+
+    def test_button_elements_detected(self):
+        self.wins.list.return_value = [
+            {"id": "0x1", "comm": "mousepad", "title": "Save Changes",
+             "x": 184, "y": 789, "w": 452, "h": 113}]
+        self.perception.capturer.native_size = (1920, 1080)
+        # Buttons inside the popup rect (permille of native screen)
+        self.perception.elements = {
+            "a": {"id": "a", "k": "t", "b": [96, 735, 60, 20],
+                  "x": "Close all tabs"},
+            "b": {"id": "b", "k": "t", "b": [200, 760, 40, 20], "x": "Cancel"},
+        }
+        found = popups_mod.detect(self.wins, self.perception)
+        out = popups_mod.summarize(found)
+        self.assertGreaterEqual(out["count"], 1)
+        self.assertEqual({b["text"] for b in out["buttons"]},
+                         {"Close all tabs", "Cancel"})
+
+    def test_x_tree_override_redirect_popup_detected(self):
+        # A notification bubble is invisible to the WM client list; only the
+        # full X tree shows it. This was the missed-popup bug.
+        self.wins.list.return_value = []
+        with unittest.mock.patch.object(popups_mod, "_extra_x_windows", return_value=[
+            {"id": "0x2a00004", "title": "Notification", "app": "x-popup",
+             "source": "x-tree"}]):
+            found = popups_mod.detect(self.wins, self.perception)
+        out = popups_mod.summarize(found)
+        self.assertGreaterEqual(out["count"], 1)
+        self.assertTrue(any("Notification" in w["title"] for w in out["windows"]))
+
+    def test_inpage_banner_detected(self):
+        # Firefox shows a warning INSIDE the page (no separate X window).
+        self.wins.list.return_value = []
+        self.perception.elements = {
+            "w": {"id": "w", "k": "t", "b": [400, 100, 600, 30],
+                  "x": "The bookmarks system will not be functional because a file is in use by another application"},
+        }
+        found = popups_mod.detect(self.wins, self.perception)
+        out = popups_mod.summarize(found)
+        self.assertGreaterEqual(out["count"], 1)
+        self.assertTrue(any("not be functional" in b["text"] for b in out["banners"]))
+
+    def test_empty_screen_no_popup(self):
+        self.wins.list.return_value = [
+            {"id": "0x1", "comm": "brave", "title": "Big normal page",
+             "x": 0, "y": 0, "w": 1200, "h": 1000}]
+        self.perception.elements = {}
+        self.assertEqual(popups_mod.summarize(popups_mod.detect(
+            self.wins, self.perception))["count"], 0)
+
+
+class TestVisionDecider(unittest.TestCase):
+    """The decider picks the explanation that repeats more of the other's
+    distinctive words -- the more accurate reading of the same screen."""
+
+    def test_mirage_picks_when_it_covers_the_words(self):
+        v = vision_mod.decide(
+            ocr_text="premium status async def env filtered",
+            mirage_lines=["premium", "status", "async def", "env", "queue"])
+        self.assertEqual(v["decided"], "mirage")
+
+    def test_ocr_picks_when_mirage_adds_nothing(self):
+        v = vision_mod.decide(
+            ocr_text="hello world", mirage_lines=[])
+        self.assertEqual(v["decided"], "ocr")
+        v = vision_mod.decide("hello world", ["lorem ipsum dolor"])
+        self.assertEqual(v["decided"], "ocr")
+
+    def test_why_names_the_coverage(self):
+        v = vision_mod.decide("alpha beta gamma", ["alpha beta gamma delta epsilon"])
+        self.assertEqual(v["decided"], "mirage")
+        self.assertIn("3/5", v["why"])
+
+
 class TestToolSurface(unittest.TestCase):
     """The registered MCP surface: element-addressed, no coordinate habits."""
 
@@ -1239,6 +1358,10 @@ class TestToolSurface(unittest.TestCase):
             mcp, unittest.mock.Mock(), unittest.mock.Mock(),
             unittest.mock.Mock(), unittest.mock.Mock(),
             awake=unittest.mock.Mock())
+
+    def test_context_menu_is_element_addressed(self):
+        self.assertNotIn("x", self.registry["context_menu"].__code__.co_varnames)
+        self.assertIn("context_menu", tools_mod._ACTIONS_NEEDING_SCREEN)
 
     def test_coordinate_tools_are_gone(self):
         for gone in ["mouse_move", "click", "double_click", "mouse_down",

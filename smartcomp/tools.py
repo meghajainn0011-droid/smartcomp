@@ -24,6 +24,8 @@ from .awake import Awake
 from .input import Input, InputError, MAX_SCROLL_TICKS, launch
 from .memory import Memory
 from .perception import Perception
+from . import popups as popups_mod
+from .vision import decide as _vision_decide, describe as _vision_describe
 from .windows import Windows
 
 
@@ -90,7 +92,63 @@ def _dominant_colors(img: np.ndarray, limit: int = 6) -> list[dict]:
     return out
 
 
+def _blank_spot(wins: Windows, perception: Perception,
+                grid: int = 9) -> list[int]:
+    """A permille point inside the active window, far from all elements.
+
+    Lets context_menu work with no coordinates from the agent: sample a grid
+    in the active window, score each point by distance to the nearest element
+    center, return the emptiest. Falls back to the window center if the store
+    is empty (nothing to avoid).
+    """
+    win = next((w for w in wins.list() if w.get("active")), None)
+    if not win:
+        return [500, 500]
+    nat_w, nat_h = perception.capturer.native_size
+    bx = int(win["x"] / max(1, nat_w) * 1000)
+    by = int(win["y"] / max(1, nat_h) * 1000)
+    bw = int(win["w"] / max(1, nat_w) * 1000)
+    bh = int(win["h"] / max(1, nat_h) * 1000)
+    centers = [_center(el["b"]) for el in perception.elements.values()]
+    if not centers:
+        return [bx + bw // 2, by + bh // 2]
+    best, best_score = None, -1
+    for i in range(1, grid):
+        for j in range(1, grid):
+            p = [bx + bw * i // grid, by + bh * j // grid]
+            score = min((p[0] - cx) ** 2 + (p[1] - cy) ** 2 for cx, cy in centers)
+            if score > best_score:
+                best, best_score = p, score
+    return best or [bx + bw // 2, by + bh // 2]
+
+
 MAX_DESCRIBE_CONTROLS = 12
+
+
+def _click_box(perception: Perception, el: dict) -> list[int]:
+    """The box to actually click -- snap tiny glyphs to a detector icon.
+
+    OCR reads a close button's "x" as a 5x9 permille text box, but the real
+    hit target is the larger icon box the detector drew around it (measured
+    live: clicking the glyph's center did nothing, clicking the overlapping
+    icon dismissed the bubble). Use the icon when one covers the glyph.
+    """
+    x, y, w, h = el["b"]
+    if w >= 25 or h >= 25 or el.get("k") == "i":
+        return el["b"]  # already a real-sized target
+    cx, cy = x + w // 2, y + h // 2
+    best = None
+    for other in perception.elements.values():
+        if other.get("k") != "i":
+            continue
+        ox, oy, ow, oh = other["b"]
+        # icon near the glyph and at least as big
+        if (abs(ox + ow // 2 - cx) <= max(20, ow)
+                and abs(oy + oh // 2 - cy) <= max(20, oh)
+                and ow >= w and oh >= h):
+            if best is None or ow * oh < best[2] * best[3]:
+                best = other["b"]
+    return best or el["b"]
 
 
 def _compose_description(active: dict | None, windows: list[dict],
@@ -319,7 +377,8 @@ def _looks_degenerate(lines: list[dict], w: int, h: int) -> bool:
 _ACTIONS_NEEDING_SCREEN = frozenset({
     # perception: pixels must show the desktop, not a lock screen
     "get_changes", "find", "read_window", "read_region", "wait_for_change",
-    "screen_state", "screenshot", "describe_screen",
+    "screen_state", "screenshot", "describe_screen", "explain_screen",
+    "popups", "watch_popups",
     # input: XTEST events go to the lock screen's grab while locked
     "context_menu", "click_element", "drag_element", "scroll", "type_text",
     "key", "key_down", "key_up",
@@ -515,6 +574,72 @@ def register(mcp, perception: Perception, inp: Input, wins: Windows, memory: Mem
         return {"ok": True, **out}
 
     @tool
+    def explain_screen() -> dict:
+        """Explain the active window: OCR + Mirage read the same pixels.
+
+        Mirage (Cactus small VLM, needs `pip install cactus-compute`) reads
+        scene/objects/colors and text; smartcomp's OCR + GPA detector read
+        text, control ids and clickable boxes from the SAME window. A decider
+        compares them for confidence, but the report MERGES both answers --
+        colors, buttons, text and scene -- for the LLM to act on. Absent
+        Mirage this degrades to the OCR explanation with decider=ocr.
+        """
+        active = next((w for w in wins.list() if w.get("active")), None)
+        # Raise the window FIRST: a screenshot grabs screen pixels at the
+        # window's rect, so an overlapping terminal would be captured instead
+        # (observed: "black page" with terminal text on a white Wikipedia
+        # page). Both readers must see the same raised pixels.
+        if active:
+            wins.activate(active["id"])
+            time.sleep(0.2)
+            active = next((w for w in wins.list() if w.get("active")), None)
+        shot = screenshot(window_id=(active_id := (
+            active["id"] if active else None
+        )))
+        if not shot.get("ok"):
+            return shot
+        perception.get_changes()
+        native_w, native_h = perception.capturer.native_size
+        desc = _compose_description(
+            active, wins.list(), list(perception.elements.values()),
+            _dominant_colors(
+                perception.capturer.grab_rect(
+                    active["x"], active["y"], active["w"], active["h"])
+            ) if active else [], [native_w, native_h])
+        # FRESH OCR of this window's pixels, NOT the persistent element store:
+        # the store keeps stale elements from earlier pages, which leaked
+        # ("Import bookmarks / OffSec / Kali") into later website reads.
+        ocr_lines = [l["x"] for l in perception.read_window(active)
+                     if l.get("x")] if active else []
+        out = {"ok": True, "decided_by": "ocr", **desc}
+        # Mirage reads from the saved window PNG (its documented input form).
+        mir = _vision_describe(shot["path"])
+        out["mirage"] = mir
+        # MERGE both readers of the same screen into ONE understanding for
+        # the LLM: OCR text + Mirage text (deduplicated), Mirage's scene /
+        # relations, smartcomp's colors, controls and clickable ids. Nothing
+        # is thrown away. The decider only annotates confidence.
+        out["decider"] = _vision_decide(" ".join(ocr_lines),
+                                        (mir.get("lines") or [])) if mir.get("ok") else {
+            "decided": "ocr", "why": mir.get("error", "unknown")}
+        mir_lines = mir.get("lines") or [] if mir.get("ok") else []
+        merged, seen = [], set()
+        for line in ocr_lines + mir_lines:
+            key = " ".join((line or "").lower().split())
+            if key and key not in seen:
+                seen.add(key)
+                merged.append(line)
+        out["mode"] = "merged"
+        out["lines"] = merged[:24]
+        out["ocr_lines"] = ocr_lines[:12]
+        out["mirage_lines"] = mir_lines[:12]
+        if mir.get("ok"):
+            out["scene"] = mir.get("scene")
+            out["relations"] = mir.get("relations")
+            out["reasoning"] = mir.get("reasoning")
+        return out
+
+    @tool
     def screenshot(path: str | None = None, window_id: str | None = None) -> dict:
         """Save a PNG of the screen, or of one window, into this session's folder.
 
@@ -664,18 +789,83 @@ def register(mcp, perception: Perception, inp: Input, wins: Windows, memory: Mem
 
     # -- pointer ----------------------------------------------------------
     @tool
-    def context_menu(x: int, y: int, report: bool = True) -> dict:
-        """Right-click a blank spot (desktop, canvas) to open its context menu.
+    def popups(report: bool = True) -> dict:
+        """List every popup/dialog currently on screen, as ids to act on.
 
-        The one deliberately-coordinate action, because blank space has no
-        element to address. Everything element-shaped goes through
-        click_element by id or label -- an agent should never reach for
-        pixel coordinates out of habit. The menu arrives in `changed` as
-        element ids the agent can act on.
+        Watches the window list (small dialog windows), the X tree
+        (override-redirect notifications), AND a FRESH OCR of the active
+        window for in-page warning banners. When a popup is found, both
+        readers describe it -- smartcomp's OCR and Mirage -- and the decider
+        merges the result, so the agent gets one first-class `popups` block.
         """
-        inp.click(*_px(perception, x, y), button="right")
-        result = {"ok": True, "at": [x, y], "button": "right"}
-        return _report_delta(perception, result, at=[x, y]) if report else result
+        perception.get_changes()
+        active = next((w for w in wins.list() if w.get("active")), None)
+        if active:
+            wins.activate(active["id"])
+            time.sleep(0.2)
+            active = next((w for w in wins.list() if w.get("active")), None)
+        # Tesseract fails on dark/complex pages (3 fragments here) while
+        # Mirage reads them -- so BOTH readers feed detection, not just OCR.
+        shot = screenshot(window_id=active["id"] if active else None)
+        ocr = [l["x"] for l in perception.read_window(active)
+               if l.get("x")] if active else []
+        mir = _vision_describe(shot["path"]) if shot.get("ok") else {"ok": False}
+        mir_lines = (mir.get("lines") or []) if mir.get("ok") else []
+        fresh = ocr + mir_lines
+        found = popups_mod.detect(wins, perception, fresh_lines=fresh)
+        out = popups_mod.summarize(found)
+        if found and report:
+            out["ocr_lines"] = ocr[:12]
+            if mir.get("ok"):
+                out["mirage_lines"] = mir_lines[:12]
+                out["decider"] = _vision_decide(" ".join(ocr), mir_lines)
+                out["scene"] = mir.get("scene")
+        return {"ok": True, "popups": out}
+
+    @tool
+    def watch_popups(timeout_s: float = 5.0) -> dict:
+        """Block until a popup appears (or timeout), then report it.
+
+        Polls the element/window state for up to timeout_s; the instant a
+        dialog or menu shows, runs the dual read (OCR + Mirage + decider)
+        and returns the same first-class `popups` block. Use after an action
+        that might open a confirmation you must not miss.
+        """
+        deadline = time.time() + max(0.0, timeout_s)
+        while True:
+            perception.get_changes()
+            found = popups_mod.detect(wins, perception)
+            if found:
+                return popups()
+            if time.time() >= deadline:
+                return {"ok": True, "popups": popups_mod.summarize([]),
+                        "waited_s": timeout_s}
+            time.sleep(min(0.3, max(0.0, deadline - time.time())))
+
+    @tool
+    def context_menu(element_id: str | None = None, label: str | None = None,
+                     report: bool = True) -> dict:
+        """Right-click an element, or a blank spot smartcomp finds itself.
+
+        The agent supplies NO coordinates: give an element id or label to
+        right-click it, or give nothing and smartcomp picks an empty spot in
+        the active window (furthest from every known element center) -- so
+        the desktop's / a canvas's context menu opens without the agent ever
+        seeing pixels. The menu arrives in `changed` as element ids.
+        """
+        at = None
+        if element_id or label:
+            el, err = _resolve_element(perception, element_id, label)
+            if err:
+                return err
+            at = list(_center(el["b"]))
+        else:
+            # Blank spot: the point in the active window maximally far from
+            # every element center. Computed here, never by the LLM.
+            at = _blank_spot(wins, perception)
+        inp.click(*_px(perception, at[0], at[1]), button="right")
+        result = {"ok": True, "right_clicked": at, "button": "right"}
+        return _report_delta(perception, result, at=at) if report else result
 
     @tool
     def click_element(element_id: str | None = None, label: str | None = None,
@@ -694,10 +884,11 @@ def register(mcp, perception: Perception, inp: Input, wins: Windows, memory: Mem
         el, err = _resolve_element(perception, element_id, label)
         if err:
             return err
-        cx, cy = _center(el["b"])
+        click_b = _click_box(perception, el)
+        cx, cy = _center(click_b)
         inp.click(*_px(perception, cx, cy), button=button, count=count)
-        result = {"ok": True, "clicked": _describe(el), "button": button,
-                  "count": count}
+        result = {"ok": True, "clicked": _describe(el),
+                  "hit_box": click_b, "button": button, "count": count}
         return _report_delta(perception, result, at=[cx, cy]) if report else result
 
     @tool
@@ -1019,14 +1210,30 @@ def register(mcp, perception: Perception, inp: Input, wins: Windows, memory: Mem
         return {"ok": True, **memory.stats(hours=hours)}
 
     @tool
-    def session_end(note: str = "") -> dict:
-        """Close the session: deletes its screenshots, reports what worked.
+    def session_end(note: str = "", auto_improve: bool = True) -> dict:
+        """Close the session: delete its screenshots, report what worked.
 
-        Also hands the box back its stock idle behaviour: a lid-lock
-        downgrade from lid_lock(on=False) is undone here (a no-op when the
-        policy was never changed).
+        auto_improve (default on) distils the session's successful actions
+        into a skill BEFORE closing: every session leaves smartcomp with a
+        reusable flow (skills gain use/win counts on replay), so more use
+        means a smarter, faster daemon. A no-op when there was nothing
+        worth distilling.
         """
         lid = awake.restore_lock_policy()
-        return {"ok": True, "lid_policy": lid, **memory.end_session(note)}
+        # Distil BEFORE end_session rotates the session id -- otherwise the
+        # skill is built from the NEW (empty) session and always fails.
+        distilled = None
+        if auto_improve:
+            from datetime import datetime
+            try:
+                distilled = memory.distill(
+                    f"auto-{datetime.now().strftime('%Y%m%d-%H%M%S')}",
+                    "self-improvement: distilled from this session's successful actions")
+            except ValueError as exc:
+                distilled = {"skipped": str(exc)}
+        result = {"ok": True, "lid_policy": lid, **memory.end_session(note)}
+        if distilled is not None:
+            result["skill"] = distilled
+        return result
 
     return registry

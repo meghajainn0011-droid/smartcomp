@@ -18,6 +18,47 @@ the release notes / roadmap for details).
 Built and measured on the target box: Kali, X11/XFCE, i3-7100U (2 cores / 4
 threads), 7.7 GB RAM, 1920x1080.
 
+## What's new in this update (v2 — dual vision + popup awareness)
+
+The first public release addressed elements, not pixels. This update adds
+**image understanding** and **popup awareness** while keeping the token cost
+low and the contract unchanged (the agent still never sees pixels).
+
+* **Two readers, one merged report** — `explain_screen()` runs smartcomp's
+  OCR + GPA detector and **Mirage** (Cactus Compute's 22 MB, 51M-parameter
+  on-device vision model, `cactus-compute`) on the **same raised window**, and
+  the decider merges both answers (text, scene, objects, colors, buttons) into
+  one first-class JSON block. Measured: on dense terminal text OCR wins; on
+  browser pages Mirage reads the prose OCR misses; on the same screen each
+  reader sees things the other doesn't, so merging is strictly more complete.
+  Mirage is optional (install with `pip install cactus-compute`); the daemon
+  degrades to OCR-only when it is absent.
+* **`popups()` / `watch_popups()`** — a first-class popup block instead of
+  burying dialogs in a delta. Detects (1) small dialog windows, (2)
+  override-redirect X windows the WM client list omits (notifications/menus),
+  (3) in-page warning banners the LLM would otherwise miss (Firefox's "files
+  in use by another application", Brave's "didn't shut down correctly"), and
+  (4) button-like elements **inside** the popup's rect. `watch_popups()`
+  blocks until one appears. Both readers describe a found popup and the
+  decider merges the result; buttons come back as element ids to act on.
+* **No coordinates, even for context menus** — `context_menu()` now takes an
+  element id/label or picks a blank spot itself; `x`/`y` are gone from its
+  schema. `click_element()` snaps tiny OCR glyphs (a 5x9 "x" close button) to
+  the overlapping detector icon that is the real hit target — verified by
+  opening and closing a browser tab by element id.
+* **Self-improvement loop** — `session_end(auto_improve=True)` (default)
+  distils each session's successful actions into a replayable skill, which
+  gains use/win counts on replay (`run_skill`). Combined with `stats()`,
+  `remember`/`recall` and session traces, every use leaves the daemon with a
+  reusable flow — it gets better the more it is used.
+* **OCR robustness** — the confidence rescue now runs on scan paths at any
+  window size (maximized pages used to get none); 2x-upscale and threshold
+  variants were measured worse and deliberately not shipped.
+
+Requires `cactus-compute` for the Mirage half of `explain_screen`/`popups`;
+everything else works with the base install. Install with
+`pip install cactus-compute` — weights (~22 MB) are cached on first use.
+
 ```
 screen ──mss──► native frame ──resize──► 960x540 logical frame
                      │                          │
@@ -66,9 +107,14 @@ reports back what the action did to the screen.**
   `click_element(label="Accept all")` (one match clicks; several return the
   candidates; none returns what IS visible so the label can be corrected),
   `type_text(text, element_id=…)`, `scroll(element_id=…)`,
-  `drag_element(start_id, end_id)`. There is no `click(x, y)`: the one
-  deliberate coordinate action is `context_menu(x, y)`, for blank space
-  that has no element to address.
+  `drag_element(start_id, end_id)`, `context_menu(element_id/label)` — the
+  context menu right-clicks an element, or a blank spot smartcomp picks
+  itself. **There are no coordinate tools in the surface**: tiny OCR glyphs
+  are snapped to their detector icon's real hit-box when clicked.
+* **Deep read + popup awareness** — `explain_screen()` merges OCR + Mirage
+  (scene, objects, text, colors) into one report. `popups()` /
+  `watch_popups()` surface any dialog, notification, in-page banner or menu
+  as a first-class block with element ids to act on.
 * **Every action reports its screen effect** — `click_element`, `type_text`,
   `key`, `scroll`, `close_window` results carry a `changed` block: the
   elements that appeared or disappeared because of the action, in the same
