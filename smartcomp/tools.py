@@ -27,6 +27,7 @@ from .perception import Perception
 from . import popups as popups_mod
 from . import sessions as sessions_mod
 from . import media as media_mod
+from . import skillbook as skillbook_mod
 from .vision import decide as _vision_decide, describe as _vision_describe
 from .windows import Windows
 
@@ -1215,13 +1216,55 @@ def register(mcp, perception: Perception, inp: Input, wins: Windows, memory: Mem
                                     voice=voice)
 
     @tool
+    def media_listen(seconds: float = 8.0, model: str = "tiny") -> dict:
+        """Listen to the system audio (what the browser is playing) and
+        transcribe with Whisper. Records the PulseAudio monitor of the default
+        output, so a playing YouTube video / reel is heard as the user hears
+        it -- no captions, no download.
+        """
+        return media_mod.listen(seconds=seconds, model=model)
+
+    @tool
+    def media_watch(seconds: float = 6.0, frames: int = 4) -> dict:
+        """Watch the current screen while a video plays: sample real frames
+        and read them with BOTH OCR and Mirage as JSON. Combined with
+        media_listen(), this understands a playing reel's graphics AND voice.
+        """
+        return media_mod.watch_screen(seconds=seconds, frames=frames)
+
+    @tool
+    def media_audio_check() -> dict:
+        """Diagnose why a playing video has no sound: system mute, browser
+        audio stream present/muted (autoplay tab mute), or no monitor source.
+        """
+        return media_mod.audio_check()
+
+    @tool
     def media_capabilities() -> dict:
-        """Which media engines are available (yt-dlp/ffmpeg/whisper)."""
-        return {"ok": True, "yt_dlp": media_mod._HAS_YTDLP,
-                "ffmpeg": media_mod._HAS_FFMPEG,
-                "faster_whisper": media_mod.has_faster_whisper(),
-                "whisper_model": "tiny int8 (default) or base int8",
-                "ram_note": "captions 0 MB; whisper tiny ~300 MB, base ~460 MB"}
+        """Which media engines are available (yt-dlp/ffmpeg/whisper/audio)."""
+        return media_mod.capabilities()
+
+    # -- pre-made + self-building skills ----------------------------------
+    @tool
+    def skills_install() -> dict:
+        """Install the built-in skills (video, audio, tabs, apps, popups,
+        isolated agents). Idempotent -- safe to call every startup.
+        """
+        return skillbook_mod.install_premade(memory)
+
+    @tool
+    def skill_create(name: str, steps: list[dict], description: str = "") -> dict:
+        """Create a new skill from steps that worked (self-building). The
+        skill can be replayed with run_skill and improves with each use.
+        """
+        return skillbook_mod.auto_skill(memory, name, steps, description)
+
+    @tool
+    def skill_learn_recent(limit: int = 12) -> dict:
+        """Build a skill automatically from the most recent successful
+        actions -- the daemon teaches itself from its own work.
+        """
+        return skillbook_mod.learn_from_recent(memory, limit=limit)
 
     @tool
     def app_status() -> dict:
@@ -1243,18 +1286,28 @@ def register(mcp, perception: Perception, inp: Input, wins: Windows, memory: Mem
         return {"ok": True, **memory.distill(name, description)}
 
     @tool
-    def run_skill(name: str) -> dict:
-        """Replay a learned skill step by step."""
+    def run_skill(name: str, args: dict | None = None) -> dict:
+        """Replay a skill step by step. `args` fills placeholders like {url}."""
         skill = memory.skill(name)
         if skill is None:
             return {"ok": False, "error": f"unknown skill {name}", "available": memory.skills()}
+        values = args or {}
         results = []
         for step in skill["steps"]:
             fn = registry.get(step["tool"])
             if fn is None:
                 results.append({"tool": step["tool"], "ok": False, "error": "not a tool"})
                 continue
-            outcome = fn(**(step.get("args") or {}))
+            step_args = dict(step.get("args") or {})
+            for k, v in list(step_args.items()):
+                if isinstance(v, str) and v.startswith("{") and v.endswith("}"):
+                    key = v[1:-1]
+                    if key in values:
+                        step_args[k] = values[key]
+                    else:
+                        return {"ok": False, "error": f"missing skill arg {{{key}}}",
+                                "skill": name, "provided": list(values)}
+            outcome = fn(**step_args)
             ok = not (isinstance(outcome, dict) and (outcome.get("ok") is False
                                                     or outcome.get("error")))
             results.append({"tool": step["tool"], "ok": ok})

@@ -25,6 +25,7 @@ from smartcomp import tools as tools_mod  # noqa: E402
 from smartcomp import popups as popups_mod  # noqa: E402
 from smartcomp import sessions as sessions_mod  # noqa: E402
 from smartcomp import vision as vision_mod  # noqa: E402
+from smartcomp import skillbook as skillbook_mod  # noqa: E402
 from Xlib import XK  # noqa: E402  (keysym ground truth for alias tests)
 from smartcomp import awake as awake_mod  # noqa: E402
 from smartcomp import input as input_mod  # noqa: E402
@@ -1258,6 +1259,46 @@ class TestCloseWindowReport(unittest.TestCase):
         self.wins.close.return_value = {"ok": False, "error": "no such window"}
         out = self.close_window(window_id="0x9")
         self.assertNotIn("changed", out)
+
+
+class TestSkillbook(unittest.TestCase):
+    """Pre-made skills + self-built skill creation from work."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="smartcomp-skill-")
+        from smartcomp.memory import Memory
+        self.mem = Memory(path=Path(self.tmp) / "memory.db")
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_premade_skills_installed(self):
+        out = skillbook_mod.install_premade(self.mem)
+        self.assertEqual(out["installed"], len(skillbook_mod.PREMADE))
+        for name in ("builtin/watch-video", "builtin/listen-reel",
+                     "builtin/research-tabs", "builtin/open-app"):
+            self.assertIsNotNone(self.mem.skill(name))
+
+    def test_premade_video_skill_has_media_steps(self):
+        steps = skillbook_mod.PREMADE["watch-video"]["steps"]
+        tools = [s["tool"] for s in steps]
+        self.assertIn("media_understand", tools)
+        self.assertIn("explain_screen", tools)
+
+    def test_auto_skill_from_work(self):
+        out = skillbook_mod.auto_skill(self.mem, "myflow", [
+            {"tool": "click_element", "args": {"label": "OK"}}])
+        self.assertTrue(out["ok"])
+        s = self.mem.skill("self/myflow")
+        self.assertEqual(s["steps"][0]["tool"], "click_element")
+
+    def test_learn_from_recent(self):
+        self.mem.log("click_element", {"label": "OK"}, True, 10)
+        self.mem.log("type_text", {"text": "hi"}, True, 10)
+        out = skillbook_mod.learn_from_recent(self.mem)
+        self.assertTrue(out["ok"])
+        self.assertGreaterEqual(out["steps"], 2)
 
 
 class TestSessionManager(unittest.TestCase):

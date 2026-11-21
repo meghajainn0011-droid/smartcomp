@@ -156,6 +156,158 @@ def _frames(source: str, work: Path, count: int, ocr) -> list[dict]:
     return out[:count]
 
 
+def _pulse_source() -> str | None:
+    """The monitor of the default output: captures what the browser plays."""
+    sink = _run(["pactl", "get-default-sink"], timeout=5).stdout.strip()
+    if not sink:
+        return None
+    out = _run(["pactl", "list", "short", "sources"], timeout=5).stdout
+    for line in out.splitlines():
+        if sink in line and "monitor" in line:
+            return line.split("\t")[1].strip()
+    return None
+
+
+def listen(seconds: float = 8.0, model: str = "tiny") -> dict:
+    """Record the system audio monitor and transcribe what is playing."""
+    src = _pulse_source()
+    if not src:
+        return {"ok": False, "error": "no PulseAudio monitor source found"}
+    work = Path(tempfile.mkdtemp(prefix="smartcomp-listen-"))
+    try:
+        wav = work / "audio.wav"
+        proc = subprocess.Popen(
+            ["parec", "--device=" + src, "--format=s16le", "--rate=16000",
+             "--channels=1", "--file-format=wav", str(wav)],
+            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+        # parec never exits on its own: run for `seconds`, then terminate.
+        # It writes a WAV header on start; ffprobe/ffmpeg still decode the
+        # PCM even though the killed file's data-size field stays 0.
+        try:
+            proc.communicate(timeout=max(2, seconds))
+        except subprocess.TimeoutExpired:
+            proc.terminate()
+            try:
+                proc.communicate(timeout=3)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.communicate()
+        if not wav.exists():
+            return {"ok": False, "error": "parec produced no file"}
+        # volume check: -91 dB means the tab is muted / nothing played
+        vol = _run(["ffmpeg", "-i", str(wav), "-af", "volumedetect",
+                    "-f", "null", "-"], timeout=30)
+        db = None
+        for line in vol.stderr.splitlines():
+            if "mean_volume:" in line:
+                try:
+                    db = float(line.split("mean_volume:")[1].split("dB")[0].strip())
+                except ValueError:
+                    pass
+        silent = db is not None and db < -70
+        transcript = [] if silent else _transcribe(wav, model)
+        return {"ok": True, "seconds": round(seconds, 1), "source": src,
+                "mean_volume_db": db, "silent": silent,
+                "transcript": transcript,
+                "hint": ("audio is muted or nothing is playing; click the "
+                         "reel's volume button then retry") if silent else ""}
+    except subprocess.TimeoutExpired:
+        return {"ok": False, "error": "recording timed out"}
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+
+def watch_screen(seconds: float = 6.0, frames: int = 4) -> dict:
+    """Sample the live screen while a video plays; OCR + Mirage each frame."""
+    import cv2
+    import numpy as np
+    from mss import mss
+    from . import vision
+    from .ocr import Ocr
+
+    work = Path(tempfile.mkdtemp(prefix="smartcomp-watch-"))
+    try:
+        ocr = Ocr()
+        out = []
+        with mss() as sct:
+            mon = sct.monitors[1]
+            for i in range(max(1, frames)):
+                raw = sct.grab(mon)
+                img = np.asarray(raw, dtype=np.uint8)[:, :, :3].copy()
+                small = cv2.resize(img, None, fx=0.5, fy=0.5,
+                                   interpolation=cv2.INTER_AREA)
+                lines = [ln.text for ln in ocr.read(small) if ln.text]
+                path = work / f"f{i}.png"
+                cv2.imwrite(str(path), small)
+                mir = vision.describe(str(path))
+                out.append({"frame": i,
+                            "ocr": lines[:8],
+                            "mirage_text": (mir.get("lines") or [])[:8] if mir.get("ok") else [],
+                            "scene": mir.get("scene"),
+                            "decider": vision.decide(" ".join(lines),
+                                                     mir.get("lines") or [])})
+                if i + 1 < frames:
+                    time.sleep(max(0, seconds / max(1, frames)))
+        return {"ok": True, "frames": out,
+                "note": "live screen pixels; not captions"}
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+
+def capabilities() -> dict:
+    """Which media engines + the audio route are available."""
+    sink = _run(["pactl", "get-default-sink"], timeout=5).stdout.strip()
+    inputs = _run(["pactl", "list", "short", "sink-inputs"], timeout=5).stdout
+    playing = [l for l in inputs.splitlines() if l.strip()]
+    return {"ok": True, "yt_dlp": _HAS_YTDLP, "ffmpeg": _HAS_FFMPEG,
+            "faster_whisper": has_faster_whisper(), "audio_monitor": _pulse_source(),
+            "default_sink": sink, "active_audio_streams": len(playing),
+            "whisper_model": "tiny int8 (default) or base int8",
+            "ram_note": "captions 0 MB; whisper tiny ~300 MB, base ~460 MB"}
+
+
+def audio_check() -> dict:
+    """Diagnose why a playing video has no sound: system mute, app stream
+    present/muted, browser autoplay (tab muted), or no monitor source."""
+    out: dict = {"ok": True}
+    # 1) default sink mute
+    try:
+        info = _run(["pactl", "get-sink-mute", "@DEFAULT_SINK@"], timeout=5).stdout.strip()
+        out["system_muted"] = "yes" in info.lower()
+    except Exception:
+        out["system_muted"] = None
+    # 2) app streams (is the browser actually sending audio?)
+    lines = _run(["pactl", "list", "sink-inputs"], timeout=5).stdout.splitlines()
+    streams = []
+    current = {}
+    for line in lines:
+        s = line.strip()
+        if "Mute:" in s:
+            current["muted"] = "yes" in s.split(":")[1].strip().lower()
+        if "application.name" in s:
+            current["app"] = s.split("=", 1)[1].strip().strip('"')
+        if s.endswith("}") and current:
+            streams.append(current)
+            current = {}
+    out["app_streams"] = streams[:6]
+    out["browser_stream"] = next(
+        (s for s in streams if any(k in s.get("app", "").lower()
+                                   for k in ("firefox", "brave", "chrom"))), None)
+    out["monitor"] = _pulse_source()
+    # verdict
+    if out.get("system_muted"):
+        out["verdict"] = "system output is muted"
+    elif not out["browser_stream"]:
+        out["verdict"] = ("no browser audio stream: the tab is muted (browser "
+                          "autoplay) or nothing is playing -- unmute in the "
+                          "page/tab and retry media_listen")
+    elif out["browser_stream"].get("muted"):
+        out["verdict"] = "browser stream is muted at the system mixer"
+    else:
+        out["verdict"] = "audio route looks healthy -- use media_listen"
+    return out
+
+
 def understand(source: str, model: str = "tiny", max_frames: int = 8,
                duration: int = 180, captions: bool = True,
                voice: bool = True) -> dict:

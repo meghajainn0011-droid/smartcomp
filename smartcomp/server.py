@@ -173,6 +173,9 @@ def serve(perception: Perception | None = None) -> None:
             "stock lock/blank behaviour kept; per-action screen guard is %s",
             "on" if config.screen_guard_enabled() else "off",
         )
+    from .skillbook import install_premade
+    installed = install_premade(memory)
+    log.info("pre-made skills installed: %d", installed["installed"])
     _mcp, app = build_app(perception, memory, awake)
     log.info("MCP listening on http://%s:%d/mcp", config.MCP_HOST, config.MCP_PORT)
     log.info("token file: %s", config.token_path())
