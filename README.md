@@ -19,6 +19,27 @@ the release notes / roadmap for details). Isolated agent sessions need `Xvfb`
 Built and measured on the target box: Kali, X11/XFCE, i3-7100U (2 cores / 4
 threads), 7.7 GB RAM, 1920x1080.
 
+## Video / voice understanding (low RAM)
+
+`media_understand(source)` turns a YouTube/video URL or local file into small
+structured JSON for the LLM — **no images** — using captions first (zero RAM),
+Whisper tiny int8 on 16 kHz audio in 30 s chunks (~40 MB weights, ~300 MB RAM;
+the unchunked CTranslate2 mel buffer is the documented OOM trap), and ffmpeg
+frame sampling + Tesseract OCR for burned-in text (reels, songs, captions).
+Returns metadata (title/duration/uploader), timestamped transcript, frame
+text, hashtags and URLs. `media_capabilities()` reports the engines. One model
+is loaded at a time, frames are released per loop, and temp files are cleaned.
+
+Verified live: a Firefox YouTube page read by smartcomp + `media_understand`
+on the same URL returned title/duration/uploader and 52 timestamped caption
+lines in ~21 s; a spoken audio clip transcribed correctly through Whisper
+tiny (`mode: whisper-tiny`, 4.7 s); two more YouTube videos returned 60
+caption lines each. **Honest limits**: this box's yt-dlp (no JS runtime)
+gets HTTP 403 downloading YouTube *video/audio data*, so frame sampling and
+the Whisper fallback work on local/direct media but not on YouTube videos —
+captions remain the path there; Instagram reels are behind a login wall, so
+`media_understand` cannot fetch them (an authenticated session is needed).
+
 ## Multiple isolated sessions (virtual cursor per agent)
 
 One X11 display has exactly one pointer, so agents that share a desktop fight
@@ -61,6 +82,11 @@ low and the contract unchanged (the agent still never sees pixels).
   (4) button-like elements **inside** the popup's rect. `watch_popups()`
   blocks until one appears. Both readers describe a found popup and the
   decider merges the result; buttons come back as element ids to act on.
+* **New-window awareness** — a window appearing after an action (e.g. a
+  Google sign-in popup with an unremarkable title/size) is now reported in
+  the action's `changed.windows` block and by `popups()` as
+  `source: "new-window"` with id/app/title/box.
+* **Video/voice understanding** — see the dedicated section below.
 * **No coordinates, even for context menus** — `context_menu()` now takes an
   element id/label or picks a blank spot itself; `x`/`y` are gone from its
   schema. `click_element()` snaps tiny OCR glyphs (a 5x9 "x" close button) to

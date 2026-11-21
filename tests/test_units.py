@@ -1380,6 +1380,32 @@ class TestPopupDetection(unittest.TestCase):
         self.assertGreaterEqual(out["count"], 1)
         self.assertTrue(any("not be functional" in b["text"] for b in out["banners"]))
 
+    def test_new_window_detected_after_click(self):
+        # The Google sign-in case: a new window with an unremarkable title
+        # and a large size must still surface as a popup candidate.
+        popups_mod._prev_windows = None
+        first = unittest.mock.Mock()
+        first.list.return_value = [{"id": "0x1", "comm": "firefox", "title": "Search",
+                                    "x": 0, "y": 0, "w": 1200, "h": 900}]
+        self.assertFalse(any(f["source"] == "new-window" for f in
+                             popups_mod.detect(first, self.perception)))
+        second = unittest.mock.Mock()
+        second.list.return_value = first.list.return_value + [
+            {"id": "0x2", "comm": "firefox", "title": "Sign in - Google Accounts",
+             "x": 400, "y": 100, "w": 720, "h": 680}]
+        found = popups_mod.detect(second, self.perception)
+        new = [f for f in found if f["source"] == "new-window"]
+        self.assertEqual(len(new), 1)
+        self.assertEqual(new[0]["title"], "Sign in - Google Accounts")
+
+    def test_new_window_summary_includes_it(self):
+        popups_mod._prev_windows = {"0x1"}
+        wins = unittest.mock.Mock()
+        wins.list.return_value = [{"id": "0x1", "comm": "a", "title": "a"},
+                                  {"id": "0x2", "comm": "firefox", "title": "Sign in"}]
+        out = popups_mod.summarize(popups_mod.detect(wins, self.perception))
+        self.assertTrue(any(w["id"] == "0x2" for w in out["windows"]))
+
     def test_empty_screen_no_popup(self):
         self.wins.list.return_value = [
             {"id": "0x1", "comm": "brave", "title": "Big normal page",

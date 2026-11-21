@@ -24,6 +24,32 @@ def _center(box: list[int]) -> list[int]:
     return [box[0] + box[2] // 2, box[1] + box[3] // 2]
 
 
+# Snapshot of window ids from the previous observation. A new window (a
+# Google sign-in popup, an OAuth dialog) can be large and have a title with
+# none of the dialog words -- size/title heuristics miss it. Comparing the
+# client list across observations catches ANY new window, which is the signal
+# an agent needs when it clicked "Login with Google".
+_prev_windows: set[str] | None = None
+
+
+def new_windows(wins) -> list[dict]:
+    """Windows that appeared since the last call (empty on the first call)."""
+    global _prev_windows
+    current = {w["id"] for w in wins.list()}
+    appeared = [] if _prev_windows is None else [
+        w for w in wins.list() if w["id"] not in _prev_windows]
+    _prev_windows = current
+    return appeared
+
+
+def describe_new_windows(windows: list[dict]) -> list[dict]:
+    """Actionable, compact view of new windows: id, app, title, box."""
+    return [{"id": w["id"], "app": w.get("comm", ""),
+             "title": (w.get("title") or "")[:80],
+             "box": [w.get("x", 0), w.get("y", 0), w.get("w", 0), w.get("h", 0)]}
+            for w in windows]
+
+
 def _extra_x_windows() -> list[dict]:
     """Mapped windows X knows about but the WM's client list omits.
 
@@ -62,10 +88,18 @@ def _extra_x_windows() -> list[dict]:
 def detect(wins, perception, fresh_lines: list[str] | None = None) -> list[dict]:
     """Return popup candidates: dialogs, X override-redirect popups, banners."""
     out: list[dict] = []
+    all_windows = wins.list()
+    # A NEW window is a popup/event even when its title and size are
+    # unremarkable (Google sign-in opens a 700x700 "Sign in" window). This
+    # is the signal the agent needs after clicking "Login with ...".
+    for w in new_windows(wins):
+        out.append({"source": "new-window", "id": w["id"],
+                    "app": w.get("comm", ""), "title": w.get("title", ""),
+                    "box": [w.get("x", 0), w.get("y", 0), w.get("w", 0), w.get("h", 0)]})
     # Only true dialog/popup windows: a confirmation title, or a small
     # transient window. A maximized app with "Settings" in its title is not
     # a popup; require small geometry for the generic case.
-    for w in wins.list():
+    for w in all_windows:
         title = (w.get("title") or "").lower()
         small = w.get("w", 9999) < 700 and 0 < w.get("h", 9999) < 500
         explicit = any(k in title for k in ("confirm", "save changes", "are you sure",
@@ -141,7 +175,7 @@ def detect(wins, perception, fresh_lines: list[str] | None = None) -> list[dict]
 
 def summarize(found: list[dict]) -> dict:
     """Compact first-class report of what popped up."""
-    windows = [f for f in found if f["source"] in ("window", "x-tree")]
+    windows = [f for f in found if f["source"] in ("window", "x-tree", "new-window")]
     buttons = []
     banners = []
     for f in found:

@@ -26,6 +26,7 @@ from .memory import Memory
 from .perception import Perception
 from . import popups as popups_mod
 from . import sessions as sessions_mod
+from . import media as media_mod
 from .vision import decide as _vision_decide, describe as _vision_describe
 from .windows import Windows
 
@@ -337,6 +338,17 @@ def _report_delta(perception: Perception, result: dict,
         if payload.get("del_dropped"):
             delta["del_dropped"] = payload["del_dropped"]
     delta["ms"] = payload.get("stats", {}).get("total")
+    # A newly appeared window (OAuth / sign-in popup) has no reliable pixel
+    # signature until it paints and may be missed by the element delta, so
+    # report window identity from the WM client list explicitly. Never leave
+    # an agent blind to a window its own click just opened.
+    if _WINS is not None:
+        try:
+            appeared = popups_mod.new_windows(_WINS)
+            if appeared:
+                delta["windows"] = popups_mod.describe_new_windows(appeared)
+        except Exception:
+            pass  # window census must never break an action report
     result["changed"] = delta
     return result
 
@@ -390,8 +402,15 @@ _ACTIONS_NEEDING_SCREEN = frozenset({
 # keep while the screen is locked.
 
 
+# Set by register() so _report_delta can include newly-appeared windows in
+# every action's `changed` block (e.g. a Google sign-in popup after a click).
+_WINS: Windows | None = None
+
+
 def register(mcp, perception: Perception, inp: Input, wins: Windows, memory: Memory,
              awake: Awake | None = None) -> None:
+    global _WINS
+    _WINS = wins
     registry: dict[str, callable] = {}
     awake = awake or Awake()
 
@@ -1124,7 +1143,18 @@ def register(mcp, perception: Perception, inp: Input, wins: Windows, memory: Mem
                 "started as a transient user service; its pid was not readable "
                 "in time -- app_status reports the real process count"
             )
-        return result
+        # Report the new window in THIS call (the Google-sign-in case: the
+        # agent must not be blind to a window its own click launched). Wait
+        # briefly for the window to map, then attach a `changed` block with
+        # the new window's id/title so the agent can act on it immediately.
+        for _ in range(12):
+            time.sleep(0.25)
+            win = apps_mod.resume_target(wins.list(), binary)
+            if win:
+                result["window"] = win["id"]
+                result["title"] = win.get("title", "")
+                break
+        return _report_delta(perception, result)
 
     # -- isolated agent sessions -------------------------------------------
     @tool
@@ -1165,6 +1195,33 @@ def register(mcp, perception: Perception, inp: Input, wins: Windows, memory: Mem
         """Training loop: distil each session's successful actions into a
         skill, feed the shared pool, then align so every session inherits it."""
         return sessions_mod.manager().train()
+
+    # -- video/voice understanding ----------------------------------------
+    @tool
+    def media_understand(source: str, model: str = "tiny", max_frames: int = 8,
+                         duration: int = 180, captions: bool = True,
+                         voice: bool = True) -> dict:
+        """Understand a video URL or file -> structured JSON (no images).
+
+        Captions first (zero RAM); else Whisper int8 on 16 kHz audio in 30 s
+        chunks (tiny ~40 MB / ~300 MB RAM, base ~75 MB); frames sampled every
+        8 s with OCR for burned-in text (reels/songs). Returns transcript,
+        frame text, hashtags and URLs. Low RAM: one model at a time, frames
+        released per loop, temp files cleaned. Good for research on YouTube
+        videos and social-media reels/songs/music.
+        """
+        return media_mod.understand(source, model=model, max_frames=max_frames,
+                                    duration=duration, captions=captions,
+                                    voice=voice)
+
+    @tool
+    def media_capabilities() -> dict:
+        """Which media engines are available (yt-dlp/ffmpeg/whisper)."""
+        return {"ok": True, "yt_dlp": media_mod._HAS_YTDLP,
+                "ffmpeg": media_mod._HAS_FFMPEG,
+                "faster_whisper": media_mod.has_faster_whisper(),
+                "whisper_model": "tiny int8 (default) or base int8",
+                "ram_note": "captions 0 MB; whisper tiny ~300 MB, base ~460 MB"}
 
     @tool
     def app_status() -> dict:
