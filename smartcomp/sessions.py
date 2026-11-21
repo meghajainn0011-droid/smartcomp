@@ -63,6 +63,16 @@ class SessionManager:
         tmp.write_text(json.dumps(reg, indent=2))
         tmp.replace(self.registry_path)
 
+    @staticmethod
+    def ensure_token(sdir: Path) -> str:
+        """Token exists before the daemon starts (endpoint needs it at once)."""
+        import secrets
+        token_file = sdir / "token"
+        if not token_file.exists():
+            token_file.write_text(secrets.token_urlsafe(32))
+            token_file.chmod(0o600)
+        return token_file.read_text().strip()
+
     # -- allocation ------------------------------------------------------
     def _free_display(self, reg: dict) -> str:
         used = set()
@@ -124,6 +134,9 @@ class SessionManager:
         port = self._free_port(reg)
         sdir = self.root / name
         sdir.mkdir(parents=True, exist_ok=True)
+        # Create the token NOW so session_endpoint()/connect works immediately,
+        # without waiting for the daemon's lazy first read (HTTP 406 check).
+        self.ensure_token(sdir)
         env = dict(os.environ, DISPLAY=display)
 
         def start(argv: list[str], use_env: dict | None = None) -> int:

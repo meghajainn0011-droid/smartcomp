@@ -820,27 +820,34 @@ def register(mcp, perception: Perception, inp: Input, wins: Windows, memory: Mem
         merges the result, so the agent gets one first-class `popups` block.
         """
         perception.get_changes()
+        # Snapshot windows BEFORE raising: activate() can re-stack/replace the
+        # client-list entries, so detecting after the raise misses a window
+        # the action report already saw (the sign-in popup case).
+        found = popups_mod.detect(wins, perception, fresh_lines=[])
         active = next((w for w in wins.list() if w.get("active")), None)
         if active:
             wins.activate(active["id"])
             time.sleep(0.2)
             active = next((w for w in wins.list() if w.get("active")), None)
-        # Tesseract fails on dark/complex pages (3 fragments here) while
-        # Mirage reads them -- so BOTH readers feed detection, not just OCR.
-        shot = screenshot(window_id=active["id"] if active else None)
-        ocr = [l["x"] for l in perception.read_window(active)
-               if l.get("x")] if active else []
-        mir = _vision_describe(shot["path"]) if shot.get("ok") else {"ok": False}
-        mir_lines = (mir.get("lines") or []) if mir.get("ok") else []
-        fresh = ocr + mir_lines
-        found = popups_mod.detect(wins, perception, fresh_lines=fresh)
-        out = popups_mod.summarize(found)
-        if found and report:
-            out["ocr_lines"] = ocr[:12]
-            if mir.get("ok"):
-                out["mirage_lines"] = mir_lines[:12]
-                out["decider"] = _vision_decide(" ".join(ocr), mir_lines)
-                out["scene"] = mir.get("scene")
+        if active:
+            shot = screenshot(window_id=active["id"] if active else None)
+            ocr = [l["x"] for l in perception.read_window(active)
+                   if l.get("x")] if active else []
+            mir = _vision_describe(shot["path"]) if shot.get("ok") else {"ok": False}
+            mir_lines = (mir.get("lines") or []) if mir.get("ok") else []
+            # Feed the fresh text into banner detection without re-consuming
+            # the window snapshot (would drop the new-window event).
+            banners = popups_mod.detect_banners(ocr + mir_lines, wins, perception)
+            found.extend(banners)
+            out = popups_mod.summarize(found)
+            if found and report:
+                out["ocr_lines"] = ocr[:12]
+                if mir.get("ok"):
+                    out["mirage_lines"] = mir_lines[:12]
+                    out["decider"] = _vision_decide(" ".join(ocr), mir_lines)
+                    out["scene"] = mir.get("scene")
+        else:
+            out = popups_mod.summarize(found)
         return {"ok": True, "popups": out}
 
     @tool

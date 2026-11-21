@@ -1335,6 +1335,29 @@ class TestSessionManager(unittest.TestCase):
             if created:
                 used_path.unlink()
 
+    def test_session_creates_token_immediately(self):
+        d = self.mgr.root / "tokentest"
+        d.mkdir(exist_ok=True)
+        token = self.mgr.ensure_token(d)
+        self.assertTrue(token)
+        self.assertEqual(self.mgr.ensure_token(d), token)  # stable
+        self.assertEqual((d / "token").stat().st_mode & 0o777, 0o600)
+
+    def test_recent_window_visible_to_second_reader(self):
+        popups_mod._prev_windows = None
+        popups_mod._recent_windows.clear()
+        w = unittest.mock.Mock()
+        win = {"id": "0x7", "comm": "firefox", "title": "Sign in - Google Accounts",
+               "x": 100, "y": 100, "w": 720, "h": 680}
+        w.list.return_value = [win]
+        first = popups_mod.new_windows(w)           # baseline -> empty
+        self.assertEqual(first, [])
+        w.list.return_value = [win, {"id": "0x8", "comm": "firefox", "title": "Popup"}]
+        second = popups_mod.new_windows(w)          # action report sees 0x8
+        self.assertEqual([x["id"] for x in second], ["0x8"])
+        # a following popups() call must still see it via recent memory
+        self.assertEqual([x["id"] for x in popups_mod.recent_windows(w)], ["0x8"])
+
     def test_registry_round_trip(self):
         self.mgr._save({"sessions": {"a": self._rec("a", ":1000", 8792)}})
         self.assertIn("a", self.mgr._load()["sessions"])
@@ -1371,6 +1394,8 @@ class TestPopupDetection(unittest.TestCase):
         self.perception = unittest.mock.Mock()
         self.perception.capturer.native_size = (1920, 1080)
         self.perception.elements = {}
+        popups_mod._prev_windows = None
+        popups_mod._recent_windows.clear()
 
     def test_dialog_window_detected(self):
         self.wins.list.return_value = [

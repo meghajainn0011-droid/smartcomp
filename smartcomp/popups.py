@@ -8,6 +8,8 @@ so watching stays fast and the LLM gets a small, first-class `popups` block.
 
 from __future__ import annotations
 
+import time
+
 DIALOG_TITLE_WORDS = (
     "confirm", "save", "close", "warning", "question", "alert", "dialog",
     "error", "remove", "delete", "permission", "allow", "restart", "update",
@@ -30,6 +32,8 @@ def _center(box: list[int]) -> list[int]:
 # client list across observations catches ANY new window, which is the signal
 # an agent needs when it clicked "Login with Google".
 _prev_windows: set[str] | None = None
+_recent_windows: dict[str, float] = {}
+_RECENT_WINDOW_TTL = 30.0
 
 
 def new_windows(wins) -> list[dict]:
@@ -39,7 +43,22 @@ def new_windows(wins) -> list[dict]:
     appeared = [] if _prev_windows is None else [
         w for w in wins.list() if w["id"] not in _prev_windows]
     _prev_windows = current
+    now = time.time()
+    for w in appeared:
+        _recent_windows[w["id"]] = now
+    # expire old entries
+    for wid, ts in list(_recent_windows.items()):
+        if now - ts > _RECENT_WINDOW_TTL:
+            _recent_windows.pop(wid, None)
     return appeared
+
+
+def recent_windows(wins, seconds: float = 15.0) -> list[dict]:
+    """Windows that appeared recently -- so both the action report and a
+    following popups() call see the same event, not just the first reader."""
+    now = time.time()
+    return [w for w in wins.list()
+            if w["id"] in _recent_windows and now - _recent_windows[w["id"]] <= seconds]
 
 
 def describe_new_windows(windows: list[dict]) -> list[dict]:
@@ -92,10 +111,19 @@ def detect(wins, perception, fresh_lines: list[str] | None = None) -> list[dict]
     # A NEW window is a popup/event even when its title and size are
     # unremarkable (Google sign-in opens a 700x700 "Sign in" window). This
     # is the signal the agent needs after clicking "Login with ...".
+    seen_new = set()
     for w in new_windows(wins):
+        seen_new.add(w["id"])
         out.append({"source": "new-window", "id": w["id"],
                     "app": w.get("comm", ""), "title": w.get("title", ""),
                     "box": [w.get("x", 0), w.get("y", 0), w.get("w", 0), w.get("h", 0)]})
+    # Include windows that appeared in the last few seconds even if an
+    # earlier reader (an action's changed block) consumed the new event.
+    for w in recent_windows(wins):
+        if w["id"] not in seen_new:
+            out.append({"source": "new-window", "id": w["id"],
+                        "app": w.get("comm", ""), "title": w.get("title", ""),
+                        "box": [w.get("x", 0), w.get("y", 0), w.get("w", 0), w.get("h", 0)]})
     # Only true dialog/popup windows: a confirmation title, or a small
     # transient window. A maximized app with "Settings" in its title is not
     # a popup; require small geometry for the generic case.
@@ -170,6 +198,27 @@ def detect(wins, perception, fresh_lines: list[str] | None = None) -> list[dict]
     if buttons:
         out.append({"source": "elements", "count": len(buttons),
                     "buttons": buttons[:8]})
+    return out
+
+
+def detect_banners(texts: list[str], wins, perception) -> list[dict]:
+    """Detect in-page warning banners from fresh reader text (no snapshot)."""
+    BANNER_WORDS = ("will not be functional", "in use by another", "cannot be",
+                    "failed to", "warning:", "error:", "not responding",
+                    "unable to", "something went wrong", "learn more")
+    active = next((w for w in wins.list() if w.get("active")), None)
+    nw, nh = perception.capturer.native_size
+    bx = int(active["x"] / max(1, nw) * 1000) if active else 0
+    by = int(active["y"] / max(1, nh) * 1000) if active else 0
+    bw = int(active["w"] / max(1, nw) * 1000) if active else 1000
+    bh = int(active["h"] / max(1, nh) * 1000) if active else 1000
+    out = []
+    for i, text in enumerate(texts):
+        text = (text or "").strip()
+        if text and any(k in text.lower() for k in BANNER_WORDS):
+            out.append({"source": "banner", "count": 1,
+                        "banners": [{"id": f"banner-{i}", "text": text[:120],
+                                     "center": [bx + bw // 2, by + 8]}]})
     return out
 
 
