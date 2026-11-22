@@ -163,8 +163,40 @@ The budget is missed for a boring reason: a 2-core ULV CPU. The detector is a
 fixed 640x640 export (80 MB ONNX), so its cost cannot be traded down without a
 different export or a GPU. OCR is the same story — see the engine comparison
 below. On this hardware the practical shape is: cheap polling (33 ms) plus an
-expensive full-screen pass (~4.7 s) when the screen actually changes. Region
-deltas sit in between, e.g. a two-tile change cost 0.57 s of OCR.
+expensive full-screen pass (~3.6 s of main-pass OCR) when the screen actually
+changes. Region deltas sit in between, e.g. a two-tile change cost 0.57 s of
+OCR.
+
+### Where the time goes, and what was cut
+
+A full-screen scan used to cost ~8.4 s on a fixed 1920x1080 frame; it now
+costs ~5.5 s (both medians of 3 runs on the same frozen frame, same load):
+
+| Stage | Before | After | Why |
+|---|---|---|---|
+| main OCR pass (native 1920x1080) | 3.5 s | 3.5 s | one tesseract pass; unchanged |
+| failed-row rescue | 3.8 s | 0.6 s | one stacked-image tesseract call instead of one process per row |
+| detector | 1.0 s | 1.0 s | fixed 640x640 ONNX export |
+| whole call | 8.4 s | 5.5 s | 1.5× |
+
+What was measured and rejected, so nobody re-tries it:
+
+* **Parallel stripes of the main pass.** Splitting the frame into 2-4
+  vertical bands and OCR-ing them concurrently gave no speedup (3 295 ms vs
+  3 328 ms) and lost half the text to lines cut at band edges.
+* **Lower OCR scale.** 0.75× saved 22 % of the pass and lost 9 % of the words;
+  0.6× lost 40 %. Small UI glyphs do not survive it, as the findings below say.
+* **psm 3 or 6 instead of psm 11.** 3 197 ms / 5 142 ms against 3 533 ms, with
+  fewer or differently-broken words. Not worth the accuracy change.
+* **Cython/C for the Python layer.** `cProfile` puts 17.0 s of an 17.6 s scan
+  inside `subprocess` (tesseract) and shows `_parse_tsv` + `_cluster_lines`
+  at 22.8 ms — 0.3 % of the call. The hot path is already C/C++ (tesseract,
+  ONNX Runtime); there is nothing for a compiled extension to win.
+
+What did help: several changed regions are OCR'd in parallel (`WORKERS`, 4
+regions: 8 909 ms → 5 371 ms), and the detector overlaps that work. A
+single-region scan stays serial on purpose — a 3-thread ONNX run competing
+with tesseract measured slower (6.1 s vs 5.4 s).
 
 ## The contract: address elements, not pixels
 

@@ -38,6 +38,23 @@ DETECTOR_THREADS = int(os.environ.get("SMARTCOMP_DET_THREADS", "3"))
 
 OCR_MIN_CONFIDENCE = 55.0
 
+# Failed rows are rescued by re-OCR at 2x on the inverted image. Those strips
+# are stacked into one image and read by a single tesseract process: a busy
+# screen fails ~25 rows, and one process per row cost 3.8 s for a handful of
+# recovered words, versus ~0.6 s for one composite pass. The cap bounds the
+# composite (and tesseract's memory) on a pathological screen.
+OCR_STRIP_BATCH = int(os.environ.get("SMARTCOMP_OCR_STRIP_BATCH", "16"))
+# White separation between stacked strips, in scaled pixels: enough that word
+# boxes never span two strips.
+OCR_STRIP_GAP = 12
+
+# OCR jobs and the detector run in a small thread pool. Both are C extensions
+# that release the GIL (a tesseract subprocess, an ONNX session run), so a
+# delta with several changed regions now overlaps its own OCR work instead of
+# paying for it one region at a time. Tesseract is pinned to one thread each
+# (OMP_THREAD_LIMIT), so workers are the parallelism knob.
+WORKERS = max(1, int(os.environ.get("SMARTCOMP_WORKERS", "3")))
+
 # A crop over this many (scaled) pixels skips the whole-image 2x rescue pass
 # on perception scans -- it would cost seconds. read_window overrides the
 # budget with the strip-based rescue (see ocr.Ocr._strip_rescue).

@@ -183,7 +183,12 @@ class TestDeepRescue(unittest.TestCase):
             shapes.append(gray.shape[:2])
             if gray.shape[:2] == (self.CROP_H, self.CROP_W):
                 return [TextLine(x=100, y=100, w=1700, h=20, text="garbled", conf=10.0)]
-            return [TextLine(x=120, y=25, w=800, h=30,
+            # The rescue pass now reads one composite image: strips stacked
+            # with a white gap above and below each. A word's y is therefore
+            # in that composite's coordinate space (half of its 2x pixels),
+            # so 25 really means 25 + gap/2 here.
+            lead = config.OCR_STRIP_GAP / 2.0
+            return [TextLine(x=120, y=25 + lead, w=800, h=30,
                              text="replaced by held modifier", conf=92.0)]
 
         with unittest.mock.patch.object(Ocr, "_tesseract_words", side_effect=side_effect):
@@ -193,9 +198,35 @@ class TestDeepRescue(unittest.TestCase):
     def test_scan_path_rescues_when_main_pass_fails(self):
         out, shapes = self._run(deep=False)
         self.assertEqual([line.text for line in out], ["replaced by held modifier"])
-        # strip-local (120, 25) + pad origin (40, 60), scale 1.0
+        # strip-local (120, 25) + pad origin (40, 60), scale 1.0; the leading
+        # composite gap must cancel out, so the answer is unchanged.
         self.assertEqual((out[0].x, out[0].y), (160, 85))
         self.assertGreaterEqual(len(shapes), 2)  # primary + strip pass ran
+
+    def test_strip_rescue_is_one_composite_pass(self):
+        """Many failed rows must not mean many tesseract processes.
+
+        The per-strip rescue started one process (and loaded the model) per
+        failed row: 22 rows measured 3.8 s for the few words it recovered.
+        All strips now go through a single stacked image, so the whole rescue
+        is exactly one extra call no matter how many rows failed.
+        """
+        crop = np.full((self.CROP_H, self.CROP_W, 3), 40, np.uint8)
+        failed = [TextLine(x=100 + i * 40, y=100 + i * 30, w=300, h=20,
+                           text=f"garbled{i}", conf=10.0) for i in range(6)]
+        shapes = []
+
+        def side_effect(gray, scale):
+            shapes.append(gray.shape[:2])
+            if gray.shape[:2] == (self.CROP_H, self.CROP_W):
+                return failed
+            return [TextLine(x=10, y=config.OCR_STRIP_GAP / 2.0 + 5, w=80, h=16,
+                             text="recovered", conf=90.0)]
+
+        with unittest.mock.patch.object(Ocr, "_tesseract_words", side_effect=side_effect):
+            out = Ocr().read(crop, deep=True)
+        self.assertEqual(len(shapes), 2, f"expected main+1 composite, got {shapes}")
+        self.assertEqual([line.text for line in out], ["recovered"] * 1)
 
     def test_no_rescue_when_main_pass_is_clean(self):
         crop = np.full((self.CROP_H, self.CROP_W, 3), 40, np.uint8)

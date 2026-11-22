@@ -164,9 +164,16 @@ class Ocr:
         identical rescue for a fraction of the cost of upscaling the entire
         window (a 1920x1039 readback re-OCRs a few 2000x40 strips, not a
         3840x2078 image). Lines come back in `gray`'s coordinate space.
+
+        The strips are stacked into one tall image and recognized in a single
+        tesseract process: a busy screen fails 20-25 rows, and one process per
+        row is 22 process starts plus 22 model loads (measured 3.8 s for 22
+        strips) for the handful of words the rescue actually recovers. One
+        composite call does the same work in ~0.6 s. Batches are capped so a
+        pathological screen cannot build a single enormous image.
         """
         scale = config.OCR_SCALE
-        seen: list[TextLine] = []
+        strips: list[tuple[int, int, np.ndarray]] = []
         for line in failed:
             pad_x, pad_y = 3 * max(line.h, 10), 2 * max(line.h, 10)
             x0 = max(0, int(line.x * scale) - pad_x)
@@ -178,19 +185,53 @@ class Ocr:
                 continue
             big = cv2.resize(strip, None, fx=2.0, fy=2.0, interpolation=cv2.INTER_CUBIC)
             _, bw = cv2.threshold(255 - big, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-            for a in self._tesseract_words(bw, 2.0):
-                if a.conf < gate:
-                    continue
-                # _cluster_lines already divided by the strip's 2x; undo the
-                # strip origin and the pre-scale so coords match `gray`'s
-                # crop-space, where the overlap comparison happens.
-                a.x = int((a.x + x0) / scale)
-                a.y = int((a.y + y0) / scale)
+            strips.append((x0, y0, bw))
+
+        seen: list[TextLine] = []
+        for i in range(0, len(strips), config.OCR_STRIP_BATCH):
+            for a in self._rescue_batch(strips[i : i + config.OCR_STRIP_BATCH], gate, scale):
                 if any(a.text == s.text and abs(a.x - s.x) < 8 and abs(a.y - s.y) < 8
                        for s in seen):
                     continue  # two failed fragments can share one strip row
                 seen.append(a)
         return seen
+
+    def _rescue_batch(self, part: list[tuple[int, int, np.ndarray]], gate: float,
+                      scale: float) -> list[TextLine]:
+        """One tesseract pass over several strips stacked vertically.
+
+        Strips are padded to a common width and separated by white bands, so
+        words never touch across strips. Every recognized word is assigned to
+        the strip whose band contains its centre, then mapped back into
+        `gray`'s coordinate space (the same arithmetic the per-strip path did).
+        """
+        width = max(bw.shape[1] for _, _, bw in part)
+        gap = config.OCR_STRIP_GAP
+        tiles: list[np.ndarray] = []
+        bands: list[tuple[float, float, int, int]] = []
+        y = 0
+        for x0, y0, bw in part:
+            tile = cv2.copyMakeBorder(
+                bw, gap, gap, 0, width - bw.shape[1], cv2.BORDER_CONSTANT, value=255
+            )
+            bands.append((y + gap, y + gap + bw.shape[0], x0, y0))
+            tiles.append(tile)
+            y += tile.shape[0]
+        composite = np.vstack(tiles) if len(tiles) > 1 else tiles[0]
+        # _cluster_lines divides by the strip's 2x scale, so a word's y here is
+        # half of its composite pixel position; halve the bands to match.
+        out: list[TextLine] = []
+        for a in self._tesseract_words(composite, 2.0):
+            if a.conf < gate:
+                continue
+            centre = a.y + a.h / 2.0
+            for top, bottom, x0, y0 in bands:
+                if top / 2.0 <= centre <= bottom / 2.0:
+                    a.x = int((a.x + x0) / scale)
+                    a.y = int((a.y - top / 2.0 + y0) / scale)
+                    out.append(a)
+                    break
+        return out
 
     @staticmethod
     def _tesseract_words(gray: np.ndarray, scale: float) -> list[TextLine]:

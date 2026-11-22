@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import hashlib
 import time
+from concurrent.futures import ThreadPoolExecutor
 
 import cv2
 import numpy as np
@@ -62,6 +63,11 @@ class Perception:
         self.elements: dict[str, dict] = {}
         self.seq = 0
         self.last_stats: dict[str, float] = {}
+        # OCR submits a process per changed region and the detector runs an
+        # ONNX session; both release the GIL, so running them together turns
+        # serial waits into overlap (see config.WORKERS). One worker keeps the
+        # old serial behaviour for a single-core box or a constrained run.
+        self._pool: ThreadPoolExecutor | None = None
 
     # -- public -----------------------------------------------------------
 
@@ -97,15 +103,43 @@ class Perception:
         for rect in work:
             kept.append(rect)
 
-        for rect in kept:
-            added.extend(self._recognize(frame.native, rect))
-            ocr_ms += self.ocr.last_ms
         # Icon detections are filtered down to the changed rects (_icons),
         # so a pass with nothing changed cannot gain icons: running the
         # detector there is a fixed tax on every idle poll, which is what
         # made get_changes cost ~5 s even when the screen stood still.
-        if self.detector.ready and (diff.full or kept):
-            dets = self.detector.detect(frame.bgr)
+        # Threads are only worth starting when there is more than one region to
+        # spread: a single full-screen region already holds the CPU, and letting
+        # a 3-thread ONNX run compete with tesseract measured slower (6.1 s vs
+        # 5.4 s for the whole call) on this box.
+        parallel = len(kept) > 1
+        det_ready = self.detector.ready and (diff.full or bool(kept))
+        det_future = (
+            self._workers().submit(self.detector.detect, frame.bgr)
+            if det_ready and parallel
+            else None
+        )
+
+        if kept:
+            # The wall time of the whole phase is what the stats report;
+            # summing per-region times would count overlapped work twice.
+            t_ocr = time.perf_counter()
+            if parallel:
+                pool = self._workers()
+                futures = [pool.submit(self._recognize, frame.native, rect) for rect in kept]
+                for future in futures:
+                    added.extend(future.result())
+            else:
+                added.extend(self._recognize(frame.native, kept[0]))
+            ocr_ms = (time.perf_counter() - t_ocr) * 1000.0
+
+        if det_ready:
+            # Multi-region calls already had the detector running alongside the
+            # OCR jobs; a single-region call runs it now, serially.
+            dets = (
+                det_future.result()
+                if det_future is not None
+                else self.detector.detect(frame.bgr)
+            )
             det_ms = self.detector.last_ms
             added.extend(self._icons(dets, kept))
 
@@ -212,6 +246,19 @@ class Perception:
         }
 
     # -- internals --------------------------------------------------------
+
+    def _workers(self) -> ThreadPoolExecutor:
+        """The OCR/detector pool, created on first use.
+
+        Lazily: tests build a Perception without __init__, and a daemon that
+        never makes a perception call should not own three idle threads.
+        """
+        pool = getattr(self, "_pool", None)
+        if pool is None:
+            pool = self._pool = ThreadPoolExecutor(
+                max_workers=config.WORKERS, thread_name_prefix="smartcomp-perc"
+            )
+        return pool
 
     def _px_box(self, permille: list[int]) -> tuple[int, int, int, int]:
         return (
