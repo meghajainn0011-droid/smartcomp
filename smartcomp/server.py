@@ -169,7 +169,12 @@ def build_app(perception: Perception, memory: Memory | None = None,
     """Return (FastMCP instance, ASGI app wrapped with auth)."""
     from mcp.server.fastmcp import FastMCP
 
-    _install_resilient_session_handler()
+    # Resilient reconnection disabled: the monkey-patch accepted requests
+    # before MCP initialization completed, leaving clients (OpenCode) with a
+    # session that returns "Invalid request parameters" on every tool call.
+    # Standard FastMCP session handling works; clients reconnect after a
+    # daemon restart on their own.
+    # _install_resilient_session_handler()
 
     mcp = FastMCP(
         "smartcomp",
