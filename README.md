@@ -59,6 +59,37 @@ lifecycle. Verified live: two independent cursors (host vs `:1000`), a Mousepad
 launched on the private display and perceived there (28 elements), healthy
 daemon on the session port, alignment/training round-trip, clean teardown.
 
+### Visible sessions (watchable, still isolated)
+
+A headless session is invisible to the human. `session_create(name,
+visible=true)` starts the session's display as an **Xephyr window on the host
+screen** instead: still its own X server, its own XTEST cursor and its own
+apps, but two agents can be watched working side by side (windows are placed
+in screen slots with a ConfigureWindow request — no synthetic input). Input
+stays inside the nested server, so nothing a session does can reach the host
+apps.
+
+That nesting is also the *only* delivery for a second cursor. Multi-pointer X
+(XInput2 master pointers) genuinely works — a second real cursor, its own
+clicks and keys, core pointer unmoved — but creating a master on a **live**
+display crashes Qt6 apps (`libQt6XcbQpa`, observed as three qterminal
+segfaults in one session). `smartcomp/mpx.py` holds the working wrapper
+(`available`, `ensure`, `list_masters`, `destroy`, with warp/button/key on the
+private connection) for a throwaway display; nothing imports it, and it must
+not be pointed at the user's own screen.
+
+`launch_app("firefox", ["https://example.com"], profile="real")` clones the
+user's real profile (cookies, logins, extensions; cache dirs skipped) into the
+session, so the nested browser is already signed in and the running browser is
+left alone. `draw_stroke(element_id, shape="circle"|"zigzag"|"spiral"|"line")`
+drags a path computed inside an element's box — canvas and webapp drawing with
+the agent naming an element rather than emitting pixels.
+
+Verified live: two visible sessions (Firefox and Brave, both on cloned
+profiles) side by side on `sketchpad.app`, `draw_stroke` returning `ok:true`
+with element deltas, then both sessions closed with no Xephyr process or
+browser left behind.
+
 ## What's new in this update (v2 — dual vision + popup awareness)
 
 The first public release addressed elements, not pixels. This update adds
@@ -524,6 +555,8 @@ screensaver behaves stock again.
 | `smartcomp/apps.py` | app census, launch resume semantics, Firefox tab counts |
 | `smartcomp/awake.py` | screensaver inhibit + DPMS control for unattended runs |
 | `smartcomp/lock.py` | lock-state detection + credential-based unlock recovery |
+| `smartcomp/sessions.py` | private Xvfb/Xephyr desktop per agent, daemon + token per session |
+| `smartcomp/mpx.py` | multi-pointer X wrapper (own cursor per master); unused, see above |
 | `smartcomp/server.py` | FastMCP streamable HTTP + bearer middleware |
 | `smartcomp/tray.py` | Gtk.StatusIcon tray, host diagnostics |
 | `smartcomp/daemon.py` | CLI: `serve`, `tray`, `once`, `bench`, `state` |
@@ -539,7 +572,6 @@ screensaver behaves stock again.
 The later milestones are deliberately absent: no DOM/browser-grade page
 reading (OCR of a downscaled render is the only way to read a page today — a
 CDP-based companion tool for Firefox/Chromium is the biggest known win), no
-per-session virtual displays (the Xephyr mechanism was verified separately —
-pointer state dies with the controlling connection, so one long-lived client
-per session is required), and no popup policy engine. The perception tier came
-first; the action and memory layers followed it.
+popup policy engine, and no automatic choice between a headless and a visible
+session — `visible` stays an explicit per-session decision. The perception
+tier came first; the action and memory layers followed it.
