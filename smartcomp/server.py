@@ -100,10 +100,76 @@ def _write_endpoint_file(registry: dict) -> None:
     log.info("endpoint file refreshed: %s (%d tools)", path, len(registry))
 
 
+def _install_resilient_session_handler() -> None:
+    """Allow clients to reconnect smoothly across daemon restarts without 'Session not found'."""
+    try:
+        import anyio
+        from uuid import uuid4
+        import mcp.server.streamable_http_manager as sm
+
+        if getattr(sm.StreamableHTTPSessionManager, "_smartcomp_resilient_installed", False):
+            return
+
+        async def _resilient_handle_stateful_request(self, scope, receive, send):
+            request = sm.Request(scope, receive)
+            request_mcp_session_id = request.headers.get(sm.MCP_SESSION_ID_HEADER)
+
+            if request_mcp_session_id is not None and request_mcp_session_id in self._server_instances:
+                transport = self._server_instances[request_mcp_session_id]
+                await transport.handle_request(scope, receive, send)
+                return
+
+            # Accept new session OR reconnected session across restarts
+            async with self._session_creation_lock:
+                new_session_id = request_mcp_session_id if request_mcp_session_id is not None else uuid4().hex
+                http_transport = sm.StreamableHTTPServerTransport(
+                    mcp_session_id=new_session_id,
+                    is_json_response_enabled=self.json_response,
+                    event_store=self.event_store,
+                    security_settings=self.security_settings,
+                    retry_interval=self.retry_interval,
+                )
+                assert http_transport.mcp_session_id is not None
+                self._server_instances[http_transport.mcp_session_id] = http_transport
+
+                async def run_server(*, task_status: sm.TaskStatus[None] = anyio.TASK_STATUS_IGNORED):
+                    async with http_transport.connect() as streams:
+                        read_stream, write_stream = streams
+                        task_status.started()
+                        try:
+                            await self.app.run(
+                                read_stream,
+                                write_stream,
+                                self.app.create_initialization_options(),
+                                stateless=False,
+                            )
+                        except Exception as e:
+                            sm.logger.error(f"Session {http_transport.mcp_session_id} crashed: {e}", exc_info=True)
+                        finally:
+                            if (
+                                http_transport.mcp_session_id
+                                and http_transport.mcp_session_id in self._server_instances
+                                and not http_transport.is_terminated
+                            ):
+                                del self._server_instances[http_transport.mcp_session_id]
+
+                assert self._task_group is not None
+                await self._task_group.start(run_server)
+                await http_transport.handle_request(scope, receive, send)
+
+        sm.StreamableHTTPSessionManager._handle_stateful_request = _resilient_handle_stateful_request
+        sm.StreamableHTTPSessionManager._smartcomp_resilient_installed = True
+        log.info("Installed resilient session reconnection handler")
+    except Exception as e:
+        log.warning("Failed to install resilient session handler: %s", e)
+
+
 def build_app(perception: Perception, memory: Memory | None = None,
               awake: Awake | None = None):
     """Return (FastMCP instance, ASGI app wrapped with auth)."""
     from mcp.server.fastmcp import FastMCP
+
+    _install_resilient_session_handler()
 
     mcp = FastMCP(
         "smartcomp",

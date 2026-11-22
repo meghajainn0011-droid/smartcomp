@@ -16,6 +16,7 @@ open right now". This module gives the agent both:
 from __future__ import annotations
 
 import json
+import os
 import struct
 import time
 from pathlib import Path
@@ -37,6 +38,18 @@ APP_ALLOWLIST = {
 }
 
 _MOZLZ4_MAGIC = b"mozLz40\0"
+
+
+def profile_args(binary: str, name: str) -> list[str]:
+    """Args that give a second instance its OWN profile (no shared session)."""
+    ident = "".join(c for c in name if c.isalnum() or c in "-_")[:24]
+    base = Path(os.environ.get("XDG_RUNTIME_DIR", "/tmp")) / "smartcomp-profiles" / ident
+    base.mkdir(parents=True, exist_ok=True)
+    if binary in ("firefox", "firefox-esr"):
+        return ["-profile", str(base / "firefox")]
+    if binary in ("brave-browser", "chromium", "google-chrome"):
+        return [f"--user-data-dir={base / binary}"]
+    return []
 
 
 def _proc_comm(pid: int) -> str:
@@ -72,9 +85,13 @@ def _proc_cmd(pid: int) -> str:
         return ""
 
 
-def processes(binary: str) -> list[dict]:
-    """Live, non-zombie processes whose executable is `binary` (or an ESR-style
-    suffixed variant of it, e.g. firefox -> firefox-esr)."""
+def processes(binary: str, display: str | None = None) -> list[dict]:
+    """Live, non-zombie processes for `binary`, scoped to a display.
+
+    A session daemon must not be blocked by a host app on another X display:
+    with `display` set, only processes whose DISPLAY matches are returned.
+    Reads /proc/<pid>/environ (best-effort: the kernel hides some entries).
+    """
     want = binary.lower()
     out: list[dict] = []
     for entry in Path("/proc").iterdir():
@@ -85,8 +102,18 @@ def processes(binary: str) -> list[dict]:
             continue
         comm = _proc_comm(pid).lower()
         cmd = _proc_cmd(pid).lower()
-        if comm == want or comm.startswith(want) or cmd == want or cmd.startswith(want):
-            out.append({"pid": pid, "comm": comm or cmd})
+        if not (comm == want or comm.startswith(want) or cmd == want or cmd.startswith(want)):
+            continue
+        if display:
+            try:
+                env = (entry / "environ").read_bytes().decode("utf-8", "replace")
+                pdisp = next((p.split("=", 1)[1] for p in env.split("\0")
+                              if p.startswith("DISPLAY=")), None)
+                if pdisp is not None and pdisp.rstrip(".0") != display.rstrip(".0"):
+                    continue
+            except OSError:
+                pass  # unreadable env: keep the process (conservative)
+        out.append({"pid": pid, "comm": comm or cmd})
     return out
 
 

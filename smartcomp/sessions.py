@@ -86,21 +86,12 @@ class SessionManager:
         return f":{n}"
 
     def _free_port(self, reg: dict) -> int:
-        used = {s["port"] for s in reg["sessions"].values()}
-        used.add(config.MCP_PORT)
-        port = config.MCP_PORT + _PORT_BASE_OFFSET
-        while port in used:
-            port += 1
-        # also refuse a port another process already owns
-        for _ in range(500):
-            with socket.socket() as sock:
-                try:
-                    sock.bind(("127.0.0.1", port))
-                except OSError:
-                    port += 1
-                    continue
-            return port
-        raise RuntimeError("no free session port")
+        # Bind to port 0: the kernel assigns a guaranteed-free port. The
+        # old "MCP_PORT + offset" scheme collided when two sessions were
+        # created close together (both picked 8795), leaving one dead.
+        with socket.socket() as sock:
+            sock.bind(("127.0.0.1", 0))
+            return sock.getsockname()[1]
 
     @staticmethod
     def _alive(pid: int) -> bool:
@@ -137,38 +128,58 @@ class SessionManager:
         # Create the token NOW so session_endpoint()/connect works immediately,
         # without waiting for the daemon's lazy first read (HTTP 406 check).
         self.ensure_token(sdir)
-        env = dict(os.environ, DISPLAY=display)
+        global_root = Path.home() / ".local" / "state" / "smartcomp"
+        env = dict(os.environ, DISPLAY=display,
+                   SMARTCOMP_OWNERS_DIR=str(global_root))
 
-        def start(argv: list[str], use_env: dict | None = None) -> int:
+        logf = sdir / "daemon.log"
+        def start(argv: list[str], use_env: dict | None = None, logfile: Path | None = None) -> int:
+            out = open(logfile, "ab") if logfile else subprocess.DEVNULL
             proc = subprocess.Popen(
                 argv, env=use_env or env, cwd=str(config.PROJECT_ROOT),
-                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                stdout=out, stderr=subprocess.STDOUT if out is not subprocess.DEVNULL else subprocess.DEVNULL,
                 start_new_session=True)
             return proc.pid
 
         xvfb_pid = start(["Xvfb", display, "-screen", "0", _GEOMETRY,
-                          "-nolisten", "tcp", "-ac", "+extension", "RANDR"])
+                          "-nolisten", "tcp", "-ac", "-noreset",
+                          "+extension", "RANDR", "-extension", "GLX"])
         wm_pid = None
         if subprocess.run(["sh", "-c", "command -v xfwm4"],
                           capture_output=True).returncode == 0:
-            time.sleep(0.4)
-            wm_pid = start(["xfwm4"])
-        time.sleep(0.3)
+            time.sleep(0.5)
+            # xfwm4 needs --replace to claim the screen and must be detached
+            # (it runs forever; subprocess.run would kill it on timeout).
+            # The session display has no other WM, so this claims cleanly.
+            wm_pid = start(["xfwm4", "--replace"])
+            time.sleep(0.6)
+        # A translucent (20%) but visible cursor for the virtual display.
+        from .cursor import make_visible_cursor
+        cursor = make_visible_cursor(str(sdir), alpha=51)
+        cursor_theme = cursor.get("theme") if cursor.get("ok") else None
         # A full daemon per session: own port/token/state dir; the virtual
-        # display has no lock, so the wake/unlock guard is off.
+        # display has no lock, so the wake/unlock guard is off. The daemon
+        # and its apps inherit the visible cursor theme.
         cenv = dict(env,
                     SMARTCOMP_PORT=str(port),
                     SMARTCOMP_STATE_DIR=str(sdir),
+                    SMARTCOMP_SESSION_NAME=name,
                     SMARTCOMP_SCREEN_GUARD="0")
+        if cursor_theme:
+            cenv["XCURSOR_THEME"] = cursor_theme
+            cenv["XCURSOR_SIZE"] = "32"
+            env["XCURSOR_THEME"] = cursor_theme
+            env["XCURSOR_SIZE"] = "32"
         bin_path = Path(sys.executable).parent / "smartcomp"
-        daemon_pid = start([str(bin_path), "serve"], cenv) if bin_path.exists() else start(
-            [sys.executable, "-m", "smartcomp", "serve"], cenv)
+        daemon_pid = (start([str(bin_path), "serve"], cenv, logf) if bin_path.exists()
+                      else start([sys.executable, "-m", "smartcomp", "serve"], cenv, logf))
         rec = {"display": display, "port": port, "pid": daemon_pid,
                "xvfb_pid": xvfb_pid, "wm_pid": wm_pid, "dir": str(sdir),
                "created": time.time()}
         reg["sessions"][name] = rec
         self._save(reg)
         return {"ok": True, "session": name, **rec,
+                "cursor": {"visible": bool(cursor_theme), "alpha": 51},
                 "endpoint": f"http://127.0.0.1:{port}/mcp",
                 "token_path": str(sdir / "token")}
 
@@ -194,6 +205,21 @@ class SessionManager:
         s = reg["sessions"].pop(name, None)
         if not s:
             return {"ok": False, "error": f"no session {name!r}"}
+        # Kill every app running on this session's display FIRST, so no app
+        # is left on screen or holding RAM after the session ends. Match by
+        # the process's DISPLAY (the same way apps.processes scopes it).
+        killed = self._kill_display_apps(s["display"])
+        # Drop this owner's app claims from the shared registry.
+        from . import ownership as own
+        saved = os.environ.get("SMARTCOMP_SESSION_NAME")
+        os.environ["SMARTCOMP_SESSION_NAME"] = name
+        try:
+            own.release_all()
+        finally:
+            if saved is not None:
+                os.environ["SMARTCOMP_SESSION_NAME"] = saved
+            else:
+                os.environ.pop("SMARTCOMP_SESSION_NAME", None)
         for key in ("pid", "wm_pid", "xvfb_pid"):
             pid = s.get(key)
             if not pid:
@@ -206,7 +232,30 @@ class SessionManager:
                 except OSError:
                     pass
         self._save(reg)
-        return {"ok": True, "closed": name}
+        return {"ok": True, "closed": name, "apps_killed": killed}
+
+    @staticmethod
+    def _kill_display_apps(display: str) -> list[dict]:
+        """Terminate GUI processes bound to `display` (app cleanup on close)."""
+        killed = []
+        for entry in Path("/proc").iterdir():
+            if not entry.name.isdigit():
+                continue
+            pid = int(entry.name)
+            try:
+                env = (entry / "environ").read_bytes().decode("utf-8", "replace")
+                pdisp = next((p.split("=", 1)[1] for p in env.split("\0")
+                              if p.startswith("DISPLAY=")), None)
+                if not pdisp or pdisp.rstrip(".0") != display.rstrip(".0"):
+                    continue
+                comm = (entry / "comm").read_text().strip()
+                if comm in ("Xvfb", "xfwm4", "smartcomp", "python3"):
+                    continue  # session infrastructure handled separately
+                os.kill(pid, 15)
+                killed.append({"pid": pid, "comm": comm})
+            except (OSError, ProcessLookupError):
+                continue
+        return killed
 
     def endpoint(self, name: str) -> dict:
         reg = self._load()

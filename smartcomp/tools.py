@@ -11,6 +11,8 @@ into `{"ok": false, "error": ...}` instead of killing the transport.
 from __future__ import annotations
 
 import functools
+import os
+import json
 import time
 from pathlib import Path
 
@@ -24,11 +26,32 @@ from .awake import Awake
 from .input import Input, InputError, MAX_SCROLL_TICKS, launch
 from .memory import Memory
 from .perception import Perception
-from . import popups as popups_mod
-from . import sessions as sessions_mod
-from . import media as media_mod
-from . import skillbook as skillbook_mod
-from .vision import decide as _vision_decide, describe as _vision_describe
+def _lazy(module: str):
+    """Import a heavy module only when its tool is first used (fast startup)."""
+    import importlib
+
+    return importlib.import_module("." + module, __package__)
+
+
+def _vision():
+    return _lazy("vision")
+
+
+def _sessions():
+    return _lazy("sessions")
+
+
+def _media():
+    return _lazy("media")
+
+
+def _skillbook():
+    return _lazy("skillbook")
+
+
+# Heavy optional subsystems imported on demand, not at daemon startup:
+# media (yt-dlp/ffmpeg), sessions (Xvfb), skillbook, vision (Mirage).
+from . import popups as popups_mod  # noqa: E402  (cheap, used by every action report)
 from .windows import Windows
 
 
@@ -445,7 +468,29 @@ def register(mcp, perception: Perception, inp: Input, wins: Windows, memory: Mem
             return result
 
         registry[fn.__name__] = wrapper
-        mcp.tool()(wrapper)
+
+        # MCP boundary: wrap the dict as a CallToolResult carrying
+        # structuredContent (real JSON) plus a small text block. Without
+        # this FastMCP sends only a text block, which clients like Antigravity
+        # save as a .txt artifact instead of using the JSON.
+        from mcp.types import CallToolResult, TextContent
+
+        @functools.wraps(fn)
+        def mcp_wrapper(*args, **kwargs):
+            out = wrapper(*args, **kwargs)
+            is_err = isinstance(out, dict) and (out.get("ok") is False or out.get("error"))
+            if not isinstance(out, dict):
+                out = {"result": out}
+            # Full JSON in the text block keeps plain-text clients (call.py,
+            # older agents) working; structuredContent gives JSON-native
+            # clients like Antigravity real JSON instead of a .txt file.
+            text = json.dumps(out, separators=(",", ":"), default=str)
+            return CallToolResult(
+                content=[TextContent(type="text", text=text)],
+                structuredContent=out,
+                isError=bool(is_err))
+
+        mcp.tool()(mcp_wrapper)
         return wrapper
 
     # -- perception -------------------------------------------------------
@@ -634,13 +679,13 @@ def register(mcp, perception: Perception, inp: Input, wins: Windows, memory: Mem
                      if l.get("x")] if active else []
         out = {"ok": True, "decided_by": "ocr", **desc}
         # Mirage reads from the saved window PNG (its documented input form).
-        mir = _vision_describe(shot["path"])
+        mir =  _vision().describe(shot["path"])
         out["mirage"] = mir
         # MERGE both readers of the same screen into ONE understanding for
         # the LLM: OCR text + Mirage text (deduplicated), Mirage's scene /
         # relations, smartcomp's colors, controls and clickable ids. Nothing
         # is thrown away. The decider only annotates confidence.
-        out["decider"] = _vision_decide(" ".join(ocr_lines),
+        out["decider"] =  _vision().decide(" ".join(ocr_lines),
                                         (mir.get("lines") or [])) if mir.get("ok") else {
             "decided": "ocr", "why": mir.get("error", "unknown")}
         mir_lines = mir.get("lines") or [] if mir.get("ok") else []
@@ -833,7 +878,7 @@ def register(mcp, perception: Perception, inp: Input, wins: Windows, memory: Mem
             shot = screenshot(window_id=active["id"] if active else None)
             ocr = [l["x"] for l in perception.read_window(active)
                    if l.get("x")] if active else []
-            mir = _vision_describe(shot["path"]) if shot.get("ok") else {"ok": False}
+            mir =  _vision().describe(shot["path"]) if shot.get("ok") else {"ok": False}
             mir_lines = (mir.get("lines") or []) if mir.get("ok") else []
             # Feed the fresh text into banner detection without re-consuming
             # the window snapshot (would drop the new-window event).
@@ -844,7 +889,7 @@ def register(mcp, perception: Perception, inp: Input, wins: Windows, memory: Mem
                 out["ocr_lines"] = ocr[:12]
                 if mir.get("ok"):
                     out["mirage_lines"] = mir_lines[:12]
-                    out["decider"] = _vision_decide(" ".join(ocr), mir_lines)
+                    out["decider"] =  _vision().decide(" ".join(ocr), mir_lines)
                     out["scene"] = mir.get("scene")
         else:
             out = popups_mod.summarize(found)
@@ -1116,10 +1161,18 @@ def register(mcp, perception: Perception, inp: Input, wins: Windows, memory: Mem
                 "error": f"not allowlisted: {name}",
                 "allowed": sorted(APP_ALLOWLIST),
             }
+        from . import ownership as own
+
         open_windows = wins.list()
-        procs = apps_mod.processes(binary)
+        display = os.environ.get("DISPLAY")
+        procs = apps_mod.processes(binary, display=display)
         target = apps_mod.resume_target(open_windows, binary)
-        if target is not None and not force:
+        holder = own.owner_of(name.lower())
+        # If another smartcomp/session owns this app, NEVER resume its window:
+        # start our own instance with a private profile instead.
+        taken = holder is not None
+        if target is not None and not force and not taken:
+            own.claim(name.lower(), target["id"], target.get("pid"))
             wins.activate(target["id"])
             return {
                 "ok": True,
@@ -1143,9 +1196,17 @@ def register(mcp, perception: Perception, inp: Input, wins: Windows, memory: Mem
                 "error": "app is running but has no window; force=true starts "
                          "another instance",
             }
-        pid = launch(binary, args)
+        launch_args = list(args or [])
+        if taken or force:
+            launch_args += apps_mod.profile_args(binary, name.lower())
+        pid = launch(binary, launch_args)
+        own.claim(name.lower(), None, pid if pid else None)
         memory.remember(f"app:{name.lower()}", {"binary": binary, "pid": pid})
-        result: dict = {"ok": True, "pid": pid, "binary": binary, "resumed": False}
+        result: dict = {"ok": True, "pid": pid, "binary": binary,
+                        "resumed": False, "private_profile": bool(taken or force)}
+        if taken:
+            result["note"] = (f"app was in use by smartcomp '{holder['owner']}' "
+                              "-- launched a separate instance with its own profile")
         if pid == 0:
             result["pid_note"] = (
                 "started as a transient user service; its pid was not readable "
@@ -1175,34 +1236,34 @@ def register(mcp, perception: Perception, inp: Input, wins: Windows, memory: Mem
         agent its own session so they never fight over one pointer. Connect
         with session_endpoint(name).
         """
-        return sessions_mod.manager().create(name)
+        return _sessions().manager().create(name)
 
     @tool
     def session_list() -> dict:
         """List isolated sessions with display, port and health."""
-        return {"ok": True, "sessions": sessions_mod.manager().list()}
+        return {"ok": True, "sessions": _sessions().manager().list()}
 
     @tool
     def session_close(name: str) -> dict:
         """Stop a session's daemon, WM and virtual display."""
-        return sessions_mod.manager().close(name)
+        return _sessions().manager().close(name)
 
     @tool
     def session_endpoint(name: str) -> dict:
         """MCP connect config (url + bearer token) for an isolated session."""
-        return sessions_mod.manager().endpoint(name)
+        return _sessions().manager().endpoint(name)
 
     @tool
     def session_align() -> dict:
         """Align memory across sessions: merge every session's skills and
         observations into the shared pool, then push the pool back to all."""
-        return sessions_mod.manager().align()
+        return _sessions().manager().align()
 
     @tool
     def session_train() -> dict:
         """Training loop: distil each session's successful actions into a
         skill, feed the shared pool, then align so every session inherits it."""
-        return sessions_mod.manager().train()
+        return _sessions().manager().train()
 
     # -- video/voice understanding ----------------------------------------
     @tool
@@ -1218,7 +1279,7 @@ def register(mcp, perception: Perception, inp: Input, wins: Windows, memory: Mem
         released per loop, temp files cleaned. Good for research on YouTube
         videos and social-media reels/songs/music.
         """
-        return media_mod.understand(source, model=model, max_frames=max_frames,
+        return _media().understand(source, model=model, max_frames=max_frames,
                                     duration=duration, captions=captions,
                                     voice=voice)
 
@@ -1229,7 +1290,7 @@ def register(mcp, perception: Perception, inp: Input, wins: Windows, memory: Mem
         output, so a playing YouTube video / reel is heard as the user hears
         it -- no captions, no download.
         """
-        return media_mod.listen(seconds=seconds, model=model)
+        return _media().listen(seconds=seconds, model=model)
 
     @tool
     def media_watch(seconds: float = 6.0, frames: int = 4) -> dict:
@@ -1237,19 +1298,19 @@ def register(mcp, perception: Perception, inp: Input, wins: Windows, memory: Mem
         and read them with BOTH OCR and Mirage as JSON. Combined with
         media_listen(), this understands a playing reel's graphics AND voice.
         """
-        return media_mod.watch_screen(seconds=seconds, frames=frames)
+        return _media().watch_screen(seconds=seconds, frames=frames)
 
     @tool
     def media_audio_check() -> dict:
         """Diagnose why a playing video has no sound: system mute, browser
         audio stream present/muted (autoplay tab mute), or no monitor source.
         """
-        return media_mod.audio_check()
+        return _media().audio_check()
 
     @tool
     def media_capabilities() -> dict:
         """Which media engines are available (yt-dlp/ffmpeg/whisper/audio)."""
-        return media_mod.capabilities()
+        return _media().capabilities()
 
     # -- pre-made + self-building skills ----------------------------------
     @tool
@@ -1257,21 +1318,37 @@ def register(mcp, perception: Perception, inp: Input, wins: Windows, memory: Mem
         """Install the built-in skills (video, audio, tabs, apps, popups,
         isolated agents). Idempotent -- safe to call every startup.
         """
-        return skillbook_mod.install_premade(memory)
+        return _skillbook().install_premade(memory)
 
     @tool
     def skill_create(name: str, steps: list[dict], description: str = "") -> dict:
         """Create a new skill from steps that worked (self-building). The
         skill can be replayed with run_skill and improves with each use.
         """
-        return skillbook_mod.auto_skill(memory, name, steps, description)
+        return _skillbook().auto_skill(memory, name, steps, description)
 
     @tool
     def skill_learn_recent(limit: int = 12) -> dict:
         """Build a skill automatically from the most recent successful
         actions -- the daemon teaches itself from its own work.
         """
-        return skillbook_mod.learn_from_recent(memory, limit=limit)
+        return _skillbook().learn_from_recent(memory, limit=limit)
+
+    @tool
+    def app_owners() -> dict:
+        """Shared knowledge: which apps are in use by which smartcomp/session.
+        Use before resuming an app so you never hijack another agent's window.
+        """
+        from . import ownership as own
+
+        return own.status()
+
+    @tool
+    def app_release(name: str) -> dict:
+        """Release this smartcomp's claim on an app (e.g. after closing it)."""
+        from . import ownership as own
+
+        return own.release(name)
 
     @tool
     def app_status() -> dict:
@@ -1389,7 +1466,11 @@ def register(mcp, perception: Perception, inp: Input, wins: Windows, memory: Mem
                     "self-improvement: distilled from this session's successful actions")
             except ValueError as exc:
                 distilled = {"skipped": str(exc)}
-        result = {"ok": True, "lid_policy": lid, **memory.end_session(note)}
+        from . import ownership as own
+
+        released = own.release_all()
+        result = {"ok": True, "lid_policy": lid, **memory.end_session(note),
+                  "apps_released": released.get("released", [])}
         if distilled is not None:
             result["skill"] = distilled
         return result

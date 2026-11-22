@@ -1261,6 +1261,44 @@ class TestCloseWindowReport(unittest.TestCase):
         self.assertNotIn("changed", out)
 
 
+class TestOwnership(unittest.TestCase):
+    """Shared app-ownership: never resume another smartcomp's app."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="smartcomp-own-")
+        os.environ["SMARTCOMP_STATE_DIR"] = self.tmp
+        os.environ["SMARTCOMP_OWNERS_DIR"] = self.tmp
+        os.environ["SMARTCOMP_SESSION_NAME"] = "alpha"
+
+    def tearDown(self):
+        os.environ.pop("SMARTCOMP_SESSION_NAME", None)
+        os.environ.pop("SMARTCOMP_OWNERS_DIR", None)
+        if "SMARTCOMP_STATE_DIR" in os.environ:
+            del os.environ["SMARTCOMP_STATE_DIR"]
+        import shutil
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_claim_and_owner_of_self_is_none(self):
+        from smartcomp import ownership as own
+        own.claim("firefox", "0x1", os.getpid())
+        self.assertIsNone(own.owner_of("firefox"))  # our own: resume OK
+
+    def test_other_session_sees_claim(self):
+        from smartcomp import ownership as own
+        own.claim("firefox", "0x1", os.getpid())
+        os.environ["SMARTCOMP_SESSION_NAME"] = "beta"
+        entry = own.owner_of("firefox")
+        self.assertIsNotNone(entry)
+        self.assertEqual(entry["owner"], "alpha")
+
+    def test_release_and_status(self):
+        from smartcomp import ownership as own
+        own.claim("firefox", "0x1", os.getpid())
+        own.release("firefox")
+        self.assertIsNone(own.owner_of("firefox"))
+        self.assertIn("claims", own.status())
+
+
 class TestSkillbook(unittest.TestCase):
     """Pre-made skills + self-built skill creation from work."""
 
