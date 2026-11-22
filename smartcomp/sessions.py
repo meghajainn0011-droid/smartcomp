@@ -117,7 +117,22 @@ class SessionManager:
             return False
 
     # -- lifecycle -------------------------------------------------------
-    def create(self, name: str = "agent") -> dict:
+    @staticmethod
+    def _visible_slot(reg: dict) -> tuple[int, int, int, int]:
+        """Where the next visible session window goes on the host screen.
+
+        Two 940x740 windows side by side leave the bottom of a 1920x1080
+        screen free: the point is to watch two agents work, not to cover the
+        human's desktop with one maximised window.
+        """
+        slots = [(20, 60), (960, 60), (20, 810), (960, 810)]
+        taken = sum(1 for s in reg["sessions"].values() if s.get("visible"))
+        x, y = slots[taken % len(slots)]
+        return x, y, 940, 740
+
+    def create(self, name: str = "agent", visible: bool = False,
+               position: tuple[int, int] | None = None,
+               size: tuple[int, int] | None = None) -> dict:
         reg = self._load()
         if name in reg["sessions"]:
             return {"ok": False, "error": f"session {name!r} already exists"}
@@ -141,9 +156,23 @@ class SessionManager:
                 start_new_session=True)
             return proc.pid
 
-        xvfb_pid = start(["Xvfb", display, "-screen", "0", _GEOMETRY,
-                          "-nolisten", "tcp", "-ac", "-noreset",
-                          "+extension", "RANDR", "-extension", "GLX"])
+        slot = self._visible_slot(reg)
+        x, y, width, height = (position[0], position[1],
+                               (size or slot)[0], (size or slot)[1]) if position else slot
+        if visible:
+            # Xephyr: a nested X server whose root window is a window on the
+            # host screen. The session keeps its own pointer (XTEST is
+            # display-local) but the human can SEE it work, and nothing an
+            # agent does can reach the host's apps.
+            host = os.environ.get("DISPLAY") or ":0"
+            xenv = dict(os.environ, DISPLAY=host)
+            screen_pid = start(["Xephyr", display, "-screen", f"{width}x{height}x24",
+                                "-ac", "-noreset", "-name", f"smartcomp-{name}"],
+                               use_env=xenv)
+        else:
+            screen_pid = start(["Xvfb", display, "-screen", "0", _GEOMETRY,
+                                "-nolisten", "tcp", "-ac", "-noreset",
+                                "+extension", "RANDR", "-extension", "GLX"])
         wm_pid = None
         if subprocess.run(["sh", "-c", "command -v xfwm4"],
                           capture_output=True).returncode == 0:
@@ -153,6 +182,8 @@ class SessionManager:
             # The session display has no other WM, so this claims cleanly.
             wm_pid = start(["xfwm4", "--replace"])
             time.sleep(0.6)
+        if visible:
+            self._place_host_window(f"smartcomp-{name}", x, y, width, height)
         # A translucent (20%) but visible cursor for the virtual display.
         from .cursor import make_visible_cursor
         cursor = make_visible_cursor(str(sdir), alpha=51)
@@ -174,14 +205,56 @@ class SessionManager:
         daemon_pid = (start([str(bin_path), "serve"], cenv, logf) if bin_path.exists()
                       else start([sys.executable, "-m", "smartcomp", "serve"], cenv, logf))
         rec = {"display": display, "port": port, "pid": daemon_pid,
-               "xvfb_pid": xvfb_pid, "wm_pid": wm_pid, "dir": str(sdir),
-               "created": time.time()}
+               "xvfb_pid": screen_pid, "wm_pid": wm_pid, "dir": str(sdir),
+               "created": time.time(), "visible": visible,
+               "geometry": [x, y, width, height]}
         reg["sessions"][name] = rec
         self._save(reg)
         return {"ok": True, "session": name, **rec,
                 "cursor": {"visible": bool(cursor_theme), "alpha": 51},
                 "endpoint": f"http://127.0.0.1:{port}/mcp",
                 "token_path": str(sdir / "token")}
+
+    @staticmethod
+    def _place_host_window(title: str, x: int, y: int, width: int, height: int,
+                           timeout: float = 8.0) -> bool:
+        """Move the nested display's window to its slot on the host screen.
+
+        Xephyr maps its window wherever the WM decides; the session is only
+        watchable if the two windows sit side by side, so they are placed
+        explicitly (a ConfigureWindow request -- no synthetic input). The
+        window is matched by WM_CLASS instance name, which is what Xephyr sets
+        from -name; its WM_NAME is "Xephyr on :1000.0 (ctrl+shift grabs
+        mouse and keyboard)", so matching the title never found it.
+        """
+        try:
+            from Xlib import X, display as xdisplay
+        except Exception:
+            return False
+        try:
+            d = xdisplay.Display(os.environ.get("DISPLAY") or None)
+        except Exception:
+            return False
+        try:
+            root = d.screen().root
+            atom = d.intern_atom("_NET_CLIENT_LIST")
+            deadline = time.time() + timeout
+            while time.time() < deadline:
+                prop = root.get_full_property(atom, X.AnyPropertyType)
+                for wid in (prop.value if prop else []):
+                    try:
+                        win = d.create_resource_object("window", wid)
+                        cls = win.get_wm_class()
+                    except Exception:
+                        continue
+                    if cls and cls[0] == title:
+                        win.configure(x=x, y=y, width=width, height=height)
+                        d.sync()
+                        return True
+                time.sleep(0.2)
+            return False
+        finally:
+            d.close()
 
     def list(self) -> list[dict]:
         reg = self._load()

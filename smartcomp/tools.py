@@ -965,6 +965,56 @@ def register(mcp, perception: Perception, inp: Input, wins: Windows, memory: Mem
         return _report_delta(perception, result, at=[cx, cy]) if report else result
 
     @tool
+    def draw_stroke(element_id: str, shape: str = "circle", scale: float = 0.6,
+                    duration: float = 1.2) -> dict:
+        """Draw a stroke inside an element: canvas, signature pad, slider.
+
+        The agent names the element and the shape; smartcomp computes the path
+        inside that element's box and drags the pointer along it -- nothing
+        here is in pixels. Shapes: circle, zigzag, spiral, line.
+        """
+        el, err = _resolve_element(perception, element_id, None)
+        if err:
+            return err
+        box = el["b"]
+        x0, y0, w, h = box[0], box[1], box[2], box[3]
+        cx, cy = x0 + w / 2, y0 + h / 2
+        shape = (shape or "circle").lower()
+        pts: list[tuple[float, float]] = []
+        if shape == "circle":
+            import math
+
+            r = max(2.0, min(w, h) / 2 * max(0.05, min(1.0, scale)))
+            steps = 48
+            for i in range(steps + 1):
+                a = 2 * math.pi * i / steps - math.pi / 2
+                pts.append((cx + r * math.cos(a), cy + r * math.sin(a)))
+        elif shape == "spiral":
+            import math
+
+            r_max = max(2.0, min(w, h) / 2 * max(0.05, min(1.0, scale)))
+            steps = 96
+            for i in range(steps + 1):
+                a = 4 * math.pi * i / steps
+                r = r_max * i / steps
+                pts.append((cx + r * math.cos(a), cy + r * math.sin(a)))
+        elif shape == "zigzag":
+            steps = 12
+            span = w * max(0.05, min(1.0, scale))
+            left = cx - span / 2
+            amp = h * max(0.05, min(1.0, scale)) / 2
+            for i in range(steps + 1):
+                pts.append((left + span * i / steps, cy + (amp if i % 2 else -amp)))
+        else:  # line
+            span = w * max(0.05, min(1.0, scale))
+            pts = [(cx - span / 2, cy), (cx + span / 2, cy)]
+        pixels = [_px(perception, px, py) for px, py in pts]
+        inp.drag(pixels, duration=duration)
+        result = {"ok": True, "shape": shape, "element": _describe(el),
+                  "points": len(pixels)}
+        return _report_delta(perception, result, at=list(_center(box)))
+
+    @tool
     def drag_element(start_id: str, end_id: str, duration: float = 0.0,
                      report: bool = True) -> dict:
         """Drag from one element to another, by id or label.
@@ -1143,7 +1193,7 @@ def register(mcp, perception: Perception, inp: Input, wins: Windows, memory: Mem
     # -- apps -------------------------------------------------------------
     @tool
     def launch_app(name: str, args: list[str] | None = None,
-                   force: bool = False) -> dict:
+                   force: bool = False, profile: str = "") -> dict:
         """Open an allowlisted app, or focus the one that is already open.
 
         brave, chromium, firefox, terminal, text-editor, file-manager,
@@ -1153,6 +1203,11 @@ def register(mcp, perception: Perception, inp: Input, wins: Windows, memory: Mem
         transient user service, so daemon restarts do not kill it (a child
         app used to die with every restart's cgroup sweep). app_status
         shows what is open.
+
+        profile="real" copies the user's own browser profile (cookies,
+        logins, extensions) into this session and launches on the copy, so
+        a nested session browses as the signed-in user without touching the
+        profile the host browser is using.
         """
         binary = APP_ALLOWLIST.get(name.lower())
         if binary is None:
@@ -1199,6 +1254,11 @@ def register(mcp, perception: Perception, inp: Input, wins: Windows, memory: Mem
         launch_args = list(args or [])
         if taken or force:
             launch_args += apps_mod.profile_args(binary, name.lower())
+        if profile == "real":
+            base = Path(os.environ.get("SMARTCOMP_STATE_DIR")
+                        or Path(os.environ.get("XDG_RUNTIME_DIR", "/tmp")) / "smartcomp-profiles"
+                        / name.lower())
+            launch_args += apps_mod.clone_profile(binary, base / "profiles")
         pid = launch(binary, launch_args)
         own.claim(name.lower(), None, pid if pid else None)
         memory.remember(f"app:{name.lower()}", {"binary": binary, "pid": pid})
@@ -1227,16 +1287,18 @@ def register(mcp, perception: Perception, inp: Input, wins: Windows, memory: Mem
 
     # -- isolated agent sessions -------------------------------------------
     @tool
-    def session_create(name: str = "agent") -> dict:
-        """Create a private virtual desktop with its own cursor and daemon.
+    def session_create(name: str = "agent", visible: bool = False) -> dict:
+        """Create a private desktop with its own cursor and daemon.
 
-        Each session gets its own Xvfb display (XTEST cursor), MCP port,
-        token, memory and skills. It keeps working while the host screen is
-        locked/asleep -- nothing here wakes or unlocks the host. Give each
-        agent its own session so they never fight over one pointer. Connect
+        Each session gets its own display (XTEST cursor), MCP port, token,
+        memory and skills, so two agents never fight over one pointer. The
+        display is headless by default and keeps working while the host is
+        locked/asleep. visible=true makes it an Xephyr window on the host
+        screen instead: the session's cursor and apps are then watchable by
+        a human, and nothing it does can reach the host's windows. Connect
         with session_endpoint(name).
         """
-        return _sessions().manager().create(name)
+        return _sessions().manager().create(name, visible=visible)
 
     @tool
     def session_list() -> dict:

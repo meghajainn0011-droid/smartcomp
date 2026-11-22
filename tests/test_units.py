@@ -1434,6 +1434,12 @@ class TestPopupDetection(unittest.TestCase):
         self.perception.elements = {}
         popups_mod._prev_windows = None
         popups_mod._recent_windows.clear()
+        # detect() also reads the live X override-redirect tree; a menu open
+        # on the developer's desktop is not part of what these tests assert.
+        self._x_patch = unittest.mock.patch.object(popups_mod, "_extra_x_windows",
+                                                   return_value=[])
+        self._x_patch.start()
+        self.addCleanup(self._x_patch.stop)
 
     def test_dialog_window_detected(self):
         self.wins.list.return_value = [
@@ -1517,6 +1523,27 @@ class TestPopupDetection(unittest.TestCase):
         self.perception.elements = {}
         self.assertEqual(popups_mod.summarize(popups_mod.detect(
             self.wins, self.perception))["count"], 0)
+
+
+class TestXWindowParsing(unittest.TestCase):
+    """Menus/notifications from the X tree are popups; utility windows are not."""
+
+    SAMPLE = """
+     0x160011b "Whisker Menu": ("wrapper-2.0" "Xfce4-panel")  1920x1080+0+0  +0+0
+     0x2000001 "xfce4-notifyd": ("xfce4-notifyd" "Xfce4-notifyd")  300x80+1000+30  +1000+30
+     0x3000001 "": ("utility" "Utility")  1x1+-100+-100  +-100+-100
+     0x4000001 "Firefox": ("firefox" "Firefox")  1200x900+700+50  +700+50
+    """
+
+    def test_parses_popup_like_windows(self):
+        titles = [f["title"] for f in popups_mod._parse_x_windows(self.SAMPLE)]
+        self.assertIn("Whisker Menu", titles)
+        self.assertIn("xfce4-notifyd", titles)
+
+    def test_skips_utility_and_normal_windows(self):
+        found = popups_mod._parse_x_windows(self.SAMPLE)
+        self.assertEqual(len(found), 2)
+        self.assertTrue(all(f["source"] == "x-tree" for f in found))
 
 
 class TestVisionDecider(unittest.TestCase):

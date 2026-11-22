@@ -69,6 +69,32 @@ def describe_new_windows(windows: list[dict]) -> list[dict]:
             for w in windows]
 
 
+def _parse_x_windows(text: str) -> list[dict]:
+    """Popup-looking windows out of `xwininfo -root -children` output.
+
+    Split from the subprocess so the parsing is testable: the live desktop's
+    own menus (a Whisker Menu open right now) otherwise leak into unit tests
+    that are about dialog detection.
+    """
+    found = []
+    for line in text.splitlines():
+        line = line.strip()
+        if not line.startswith("0x"):
+            continue
+        wid = line.split(None, 1)[0]
+        rest = line[len(wid):].strip()
+        title = rest.split('"')[1] if '"' in rest else ""
+        low = (title + " " + rest).lower()
+        # Skip the 10x10 / 1x1 offscreen utility windows.
+        if "+-100" in line or " 1x1+" in line or " 10x10+" in line:
+            continue
+        if any(k in low for k in ("notif", "menu", "dialog", "warning",
+                                  "confirm", "popup", "alert", "tooltip")):
+            found.append({"id": wid, "title": title, "app": "x-popup",
+                          "source": "x-tree"})
+    return found
+
+
 def _extra_x_windows() -> list[dict]:
     """Mapped windows X knows about but the WM's client list omits.
 
@@ -85,23 +111,7 @@ def _extra_x_windows() -> list[dict]:
             capture_output=True, text=True, timeout=3).stdout
     except Exception:
         return []
-    found = []
-    for line in out.splitlines():
-        line = line.strip()
-        if not line.startswith("0x"):
-            continue
-        wid = line.split(None, 1)[0]
-        rest = line[len(wid):].strip()
-        title = rest.split('"')[1] if '"' in rest else ""
-        low = (title + " " + rest).lower()
-        # Skip the 10x10 / 1x1 offscreen utility windows.
-        if "+-100" in line or " 1x1+" in line or " 10x10+" in line:
-            continue
-        if any(k in low for k in ("notif", "menu", "dialog", "warning",
-                                  "confirm", "popup", "alert", "tooltip")):
-            found.append({"id": wid, "title": title, "app": "x-popup",
-                          "source": "x-tree"})
-    return found
+    return _parse_x_windows(out)
 
 
 def detect(wins, perception, fresh_lines: list[str] | None = None) -> list[dict]:

@@ -52,6 +52,118 @@ def profile_args(binary: str, name: str) -> list[str]:
     return []
 
 
+#: Profile files that are pure cache. Copying them makes a clone slow and buys
+#: nothing: the browser rebuilds them on first use.
+_PROFILE_SKIP = (
+    "cache", "cache2", "startupcache", "startupCache", "shader-cache", "shadercache",
+    "cache2*", "thumbnails", "crashes", "minidumps", "datareporting", "saved-telemetry-pings",
+    "security_state", "storage", "lock", ".parentlock", "lockfile",
+    "SingletonLock", "SingletonCookie", "SingletonSocket",
+)
+
+
+def _firefox_default_profile() -> Path | None:
+    """The profile Firefox actually opens (from profiles.ini, not a guess).
+
+    [Install*] is the launcher's own choice and wins: on this box it points at
+    the populated `*.default-esr` profile while [Profile1] still carries
+    Default=1 on an empty one, so preferring the Profile flag clones a browser
+    with no logins in it.
+    """
+    import configparser
+
+    base = Path.home() / ".mozilla" / "firefox"
+    ini = base / "profiles.ini"
+    if not ini.exists():
+        return None
+    parser = configparser.ConfigParser()
+    try:
+        parser.read(ini)
+    except Exception:
+        return None
+
+    def resolve(path: str) -> Path:
+        return Path(path) if Path(path).is_absolute() else base / path
+
+    for section in parser.sections():
+        if section.startswith("Install"):
+            chosen = parser.get(section, "Default", fallback="")
+            if chosen and resolve(chosen).is_dir():
+                return resolve(chosen)
+    candidates: list[tuple[bool, Path]] = []
+    for section in parser.sections():
+        if not section.startswith("Profile"):
+            continue
+        path = parser.get(section, "Path", fallback="")
+        if not path:
+            continue
+        is_default = parser.get(section, "Default", fallback="0") == "1"
+        full = resolve(path)
+        candidates.append((is_default, full))
+    for is_default, full in candidates:
+        if is_default and full.is_dir():
+            return full
+    for _, full in candidates:
+        if full.is_dir():
+            return full
+    return None
+
+
+def _chromium_profile(binary: str) -> tuple[Path, Path] | None:
+    """(user-data dir, Default profile dir) for a Chromium-family browser."""
+    roots = {
+        "brave-browser": Path.home() / ".config" / "BraveSoftware" / "Brave-Browser",
+        "chromium": Path.home() / ".config" / "chromium",
+        "google-chrome": Path.home() / ".config" / "google-chrome",
+    }
+    root = roots.get(binary)
+    if root is None or not (root / "Default").is_dir():
+        return None
+    return root, root / "Default"
+
+
+def clone_profile(binary: str, dest: Path) -> list[str]:
+    """Copy the user's real browser profile into ``dest``; return launch args.
+
+    A nested session has to look like the user's browser -- signed in, same
+    extensions, same cookies -- or every site asks to log in again and the
+    agent is testing a browser nobody uses. The running profile cannot be
+    shared (it is locked, and its windows belong to the host display), so the
+    directory is copied once per session and the nested instance runs on the
+    copy. Cache directories are skipped; logins, cookies, history and
+    preferences are kept.
+
+    Chromium keeps the cookie encryption key in "Local State" next to the
+    profile, so that file is copied too -- without it the cookies arrive but
+    cannot be decrypted.
+    """
+    import shutil
+
+    dest.mkdir(parents=True, exist_ok=True)
+    if binary in ("firefox", "firefox-esr"):
+        src = _firefox_default_profile()
+        if src is None:
+            return profile_args(binary, dest.name)
+        target = dest / "firefox"
+        if not (target / "prefs.js").exists():
+            shutil.copytree(src, target, ignore=shutil.ignore_patterns(*_PROFILE_SKIP),
+                            dirs_exist_ok=True)
+        return ["-profile", str(target)]
+    found = _chromium_profile(binary)
+    if found is None:
+        return profile_args(binary, dest.name)
+    root, default = found
+    target = dest / binary
+    if not (target / "Default" / "Preferences").exists():
+        (target / "Default").mkdir(parents=True, exist_ok=True)
+        shutil.copytree(default, target / "Default",
+                        ignore=shutil.ignore_patterns(*_PROFILE_SKIP), dirs_exist_ok=True)
+        local_state = root / "Local State"
+        if local_state.exists():
+            shutil.copy2(local_state, target / "Local State")
+    return [f"--user-data-dir={target}"]
+
+
 def _proc_comm(pid: int) -> str:
     try:
         return Path(f"/proc/{pid}/comm").read_text().strip()
