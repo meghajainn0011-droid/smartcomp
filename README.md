@@ -482,6 +482,7 @@ cd /home/damon/smartcomp
 .venv/bin/python -m smartcomp.daemon once       # one JSON pass
 .venv/bin/python -m smartcomp.daemon bench      # T3/T4/T5 measurement
 .venv/bin/python tests/mcp_smoke.py             # end-to-end MCP client
+.venv/bin/python scripts/mcp_compat.py          # client-dialect matrix (24 checks)
 .venv/bin/python -m unittest discover -s tests  # unit tests
 ```
 
@@ -523,11 +524,55 @@ supports streamable HTTP can attach with:
 ```
 
 Clients that cannot read files can parse `~/.local/state/smartcomp/mcp.json`
-directly — it already contains the exact `url` and `headers` to use. Verify a
-connection from anywhere:
+directly — it already contains the exact `url` and `headers` to use. The token
+is read from that file, never from this document.
+
+Per-harness snippets, all verified against the running daemon:
+
+| Agent | Config | Verified |
+|---|---|---|
+| Antigravity / `agy` | `~/.gemini/config/mcp_config.json` → `mcpServers.smartcomp = {url, headers}` | `agy mcp list` shows it enabled; a real `agy -p "call smartcomp list_windows"` returned the live window count |
+| opencode | `opencode mcp add --global --url … --header Authorization=Bearer … smartcomp` | `opencode mcp list` → `✓ smartcomp connected`; a real `opencode run` fetched the window count |
+| Claude Code | `claude mcp add --transport http --scope user smartcomp <url> --header "Authorization: Bearer …"` | `claude mcp list` → `✔ Connected` |
+| Python SDK | `streamablehttp_client(url, headers={...})` | `tests/mcp_smoke.py`, `scripts/mcp_compat.py` |
+
+Note the two config shapes: Antigravity keys servers under `mcpServers` with a
+`url` + `headers`; opencode's current CLI writes `mcp.servers.<name>` with
+`type: "remote"`. A hand-written `mcp.servers` block from an older opencode is
+simply ignored (`opencode mcp list` says "No MCP servers configured"), so use
+the CLI rather than editing that file by hand.
+
+### Client-dialect matrix
+
+Real agents are not identical MCP clients, and each deviation used to surface
+as an error the caller could not interpret. `scripts/mcp_compat.py` starts a
+throwaway daemon and checks the whole matrix — **24/24 pass** today:
+
+| Behaviour | Before | Now |
+|---|---|---|
+| stateless client: `tools/list` with no session id and no `initialize` | `400 Missing session ID` | serves it statelessly |
+| client replaying a session id from before a daemon restart | `Session not found` / empty result | adopts the id and serves it |
+| client sending only `Accept: application/json` (no SSE) | `406 Not Acceptable` | JSON response |
+| `Accept: */*` or no `Accept` at all | treated as JSON-only by the new code | normal SSE reply |
+| sessionless `GET /mcp` (SSE probe) | `400` | `405` as the spec defines |
+| unknown tool / missing arguments | — | JSON-RPC error / `isError`, never a crash |
+| `initialize` with 2024-11-05 … 2025-11-25 | — | all negotiated and accepted |
+| `MCP-Protocol-Version` echoed back | — | accepted for every supported version |
+| 6 calls on one session, 3 clients initializing at once | — | all 200 |
+| no token / wrong token | — | 401 |
+
+What the dialects mean in practice: an `initialize` starts a real session (the
+client keeps its id and gets SSE replies); no session plus no `initialize` is
+served statelessly, because smartcomp keeps no per-MCP-session state — the
+elements, memory and skills live in the daemon, not in the transport session.
+The `sessions` tools are separate agents with their own daemon and port, not
+transport sessions.
+
+Verify a connection from anywhere (405 or 406 both mean "the endpoint answered
+and the token was accepted" — a dead port fails to connect instead):
 
 ```bash
-curl -s http://127.0.0.1:8791/mcp \
+curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:8791/mcp \
   -H "Authorization: Bearer $(cat ~/.local/state/smartcomp/token)"
 ```
 

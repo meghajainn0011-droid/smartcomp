@@ -100,8 +100,95 @@ def _write_endpoint_file(registry: dict) -> None:
     log.info("endpoint file refreshed: %s (%d tools)", path, len(registry))
 
 
+def _header(scope, name: str) -> str | None:
+    for key, value in scope.get("headers", []):
+        if key.decode("latin-1").lower() == name:
+            return value.decode("latin-1")
+    return None
+
+
+async def _read_request_body(receive) -> bytes:
+    chunks: list[bytes] = []
+    more = True
+    while more:
+        message = await receive()
+        if message.get("type") != "http.request":
+            break
+        chunks.append(message.get("body", b""))
+        more = message.get("more_body", False)
+    return b"".join(chunks)
+
+
+def _replay_receive(body: bytes, receive):
+    """A receive() that hands the already-read body to the transport once.
+
+    Routing needs the JSON-RPC method, and the transport also needs the body;
+    ASGI only delivers it once, so the buffered copy is replayed and the
+    original receive is left untouched for anything after it.
+    """
+    state = {"sent": False}
+
+    async def replay():
+        if not state["sent"]:
+            state["sent"] = True
+            return {"type": "http.request", "body": body, "more_body": False}
+        return await receive()
+
+    return replay
+
+
+def _accepts_event_stream(accept: str | None) -> bool:
+    """Does this Accept header allow an SSE response?
+
+    `*/*` and `application/*` do -- agents that send a blanket Accept (or none
+    at all, which HTTP defaults to `*/*`) can consume the normal SSE reply, and
+    treating them as JSON-only would silently downgrade them.
+    """
+    value = (accept or "").strip().lower()
+    if not value:
+        return True
+    for part in value.split(","):
+        media = part.split(";")[0].strip()
+        if media.startswith(("text/event-stream", "application/*", "*/*")):
+            return True
+    return False
+
+
+async def _json_reply(send, status: int, message: str) -> None:
+    body = json.dumps(
+        {"jsonrpc": "2.0", "id": "server-error", "error": {"code": -32600, "message": message}}
+    ).encode()
+    await send({
+        "type": "http.response.start",
+        "status": status,
+        "headers": [(b"content-type", b"application/json"),
+                    (b"content-length", str(len(body)).encode())],
+    })
+    await send({"type": "http.response.body", "body": body})
+
+
 def _install_resilient_session_handler() -> None:
-    """Allow clients to reconnect smoothly across daemon restarts without 'Session not found'."""
+    """One HTTP endpoint, every dialect real agents speak.
+
+    Agents differ in ways the spec allows but the stock handler does not
+    accommodate, and each difference surfaced as an error the caller could not
+    interpret -- indistinguishable from "the MCP server is broken":
+
+    * a stateless client (no ``initialize``, no session id, e.g. a one-shot
+      smoke test or a bridge that reconnects per call) got
+      ``Bad Request: Missing session ID``;
+    * a client sending only ``Accept: application/json`` got 406, though the
+      server can answer in exactly that form;
+    * a GET probe with no session got 400 instead of the 405 the spec defines
+      for "no server-to-client stream here";
+    * and the original case this handler exists for: a client replaying a
+      session id from before a daemon restart got ``Session not found``.
+
+    So: sessions are keyed by the client's own id (a stale one is adopted, not
+    rejected), requests with neither session nor ``initialize`` are served
+    statelessly, JSON-only clients get JSON responses, and a sessionless GET is
+    answered 405 instead of 400.
+    """
     try:
         import anyio
         from uuid import uuid4
@@ -111,26 +198,67 @@ def _install_resilient_session_handler() -> None:
             return
 
         async def _resilient_handle_stateful_request(self, scope, receive, send):
-            request = sm.Request(scope, receive)
-            request_mcp_session_id = request.headers.get(sm.MCP_SESSION_ID_HEADER)
-
-            if request_mcp_session_id is not None and request_mcp_session_id in self._server_instances:
-                transport = self._server_instances[request_mcp_session_id]
-                await transport.handle_request(scope, receive, send)
+            if scope.get("type") != "http":
+                await self.app(scope, receive, send)
                 return
 
-            # Accept new session OR reconnected session across restarts
+            method = scope.get("method", "")
+            session_id = _header(scope, sm.MCP_SESSION_ID_HEADER)
+            json_only = not _accepts_event_stream(_header(scope, "accept"))
+
+            # A live session is handled by its own transport -- unless the
+            # client asks for JSON only, which an SSE-mode transport cannot
+            # answer (406). Those fall through to the stateless JSON path
+            # below rather than failing a request the server can serve.
+            if session_id and session_id in self._server_instances and not json_only:
+                await self._server_instances[session_id].handle_request(scope, receive, send)
+                return
+
+            if method == "GET" and not session_id:
+                # Nothing to resume and no server-initiated messages to push.
+                await _json_reply(
+                    send, 405,
+                    "Method Not Allowed: GET needs an existing session id; POST JSON-RPC instead",
+                )
+                return
+            if method not in ("POST", "DELETE"):
+                await _json_reply(send, 405, f"Method Not Allowed: {method} on the MCP endpoint")
+                return
+
+            body = await _read_request_body(receive) if method == "POST" else b""
+            rpc_method = None
+            if body:
+                try:
+                    parsed = json.loads(body)
+                    if isinstance(parsed, dict):
+                        rpc_method = parsed.get("method")
+                except json.JSONDecodeError:
+                    pass  # the transport reports parse errors with the right code
+
+            # Which dialect is this? An `initialize` starts a real session; an
+            # unknown id is a client that outlived a restart, so adopt it and
+            # serve it without a handshake; no id at all is a stateless caller.
+            # A JSON-only client cannot consume SSE at all, so it is served
+            # statelessly (smartcomp keeps no per-session state) instead of
+            # being told 406 by an SSE-mode transport.
+            starts_session = rpc_method == "initialize" and not json_only
+            keep_session = bool(session_id) and not json_only
+            register = starts_session or keep_session
+            require_handshake = starts_session
+
             async with self._session_creation_lock:
-                new_session_id = request_mcp_session_id if request_mcp_session_id is not None else uuid4().hex
+                new_session_id = session_id if keep_session else None
+                if starts_session and new_session_id is None:
+                    new_session_id = uuid4().hex
                 http_transport = sm.StreamableHTTPServerTransport(
                     mcp_session_id=new_session_id,
-                    is_json_response_enabled=self.json_response,
-                    event_store=self.event_store,
+                    is_json_response_enabled=self.json_response or json_only,
+                    event_store=self.event_store if register else None,
                     security_settings=self.security_settings,
                     retry_interval=self.retry_interval,
                 )
-                assert http_transport.mcp_session_id is not None
-                self._server_instances[http_transport.mcp_session_id] = http_transport
+                if register and new_session_id:
+                    self._server_instances[new_session_id] = http_transport
 
                 async def run_server(*, task_status: sm.TaskStatus[None] = anyio.TASK_STATUS_IGNORED):
                     async with http_transport.connect() as streams:
@@ -141,25 +269,27 @@ def _install_resilient_session_handler() -> None:
                                 read_stream,
                                 write_stream,
                                 self.app.create_initialization_options(),
-                                stateless=False,
+                                stateless=not require_handshake,
                             )
                         except Exception as e:
-                            sm.logger.error(f"Session {http_transport.mcp_session_id} crashed: {e}", exc_info=True)
+                            sm.logger.error(
+                                "Session %s crashed: %s", http_transport.mcp_session_id, e,
+                                exc_info=True,
+                            )
                         finally:
-                            if (
-                                http_transport.mcp_session_id
-                                and http_transport.mcp_session_id in self._server_instances
-                                and not http_transport.is_terminated
-                            ):
-                                del self._server_instances[http_transport.mcp_session_id]
+                            sid = http_transport.mcp_session_id
+                            if sid and sid in self._server_instances and http_transport.is_terminated:
+                                del self._server_instances[sid]
 
                 assert self._task_group is not None
                 await self._task_group.start(run_server)
-                await http_transport.handle_request(scope, receive, send)
+                await http_transport.handle_request(scope, _replay_receive(body, receive), send)
+                if not register:
+                    await http_transport.terminate()
 
         sm.StreamableHTTPSessionManager._handle_stateful_request = _resilient_handle_stateful_request
         sm.StreamableHTTPSessionManager._smartcomp_resilient_installed = True
-        log.info("Installed resilient session reconnection handler")
+        log.info("Installed resilient session handler (stateless + json-only + reconnect)")
     except Exception as e:
         log.warning("Failed to install resilient session handler: %s", e)
 
@@ -169,12 +299,9 @@ def build_app(perception: Perception, memory: Memory | None = None,
     """Return (FastMCP instance, ASGI app wrapped with auth)."""
     from mcp.server.fastmcp import FastMCP
 
-    # Resilient reconnection disabled: the monkey-patch accepted requests
-    # before MCP initialization completed, leaving clients (OpenCode) with a
-    # session that returns "Invalid request parameters" on every tool call.
-    # Standard FastMCP session handling works; clients reconnect after a
-    # daemon restart on their own.
-    # _install_resilient_session_handler()
+    # Resilient reconnection: allows clients across daemon restarts to resume
+    # without "Session not found" or "Invalid request parameters" (stateless=True).
+    _install_resilient_session_handler()
 
     mcp = FastMCP(
         "smartcomp",

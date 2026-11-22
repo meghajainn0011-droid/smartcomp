@@ -111,8 +111,11 @@ class SessionManager:
         try:
             urllib.request.urlopen(req, timeout=3)
             return True
-        except urllib.error.HTTPError as exc:  # 406 = live, auth passed
-            return exc.code in (200, 406)
+        except urllib.error.HTTPError as exc:
+            # Any JSON-RPC-level refusal means the server answered: 405 is the
+            # spec'd "no stream for a sessionless GET", 406 the older
+            # "Accept must include event-stream". A dead port raises instead.
+            return exc.code in (200, 405, 406)
         except Exception:
             return False
 

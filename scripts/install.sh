@@ -61,7 +61,9 @@ for _ in $(seq 1 45); do
     CODE=$(curl -s -m 2 -o /dev/null -w "%{http_code}" \
         -H "Authorization: Bearer $(cat "$TOKEN_FILE")" \
         http://127.0.0.1:8791/mcp 2>/dev/null || true)
-    [ "$CODE" = "406" ] && break
+    # 405 (sessionless GET) or 406 (Accept without event-stream) both mean the
+    # MCP endpoint answered, i.e. the daemon is up and the token is right.
+    { [ "$CODE" = "405" ] || [ "$CODE" = "406" ]; } && break
 done
 mkdir -p "$STATE_DIR"
 chmod 700 "$STATE_DIR"
