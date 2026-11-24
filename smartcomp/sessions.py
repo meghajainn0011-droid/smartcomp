@@ -192,13 +192,14 @@ class SessionManager:
         cursor = make_visible_cursor(str(sdir), alpha=51)
         cursor_theme = cursor.get("theme") if cursor.get("ok") else None
         # A full daemon per session: own port/token/state dir; the virtual
-        # display has no lock, so the wake/unlock guard is off. The daemon
-        # and its apps inherit the visible cursor theme.
+        # display has no lock of its own, so the host-lock gate is off (it is
+        # already skipped for a daemon carrying SMARTCOMP_SESSION_NAME). The
+        # daemon and its apps inherit the visible cursor theme.
         cenv = dict(env,
                     SMARTCOMP_PORT=str(port),
                     SMARTCOMP_STATE_DIR=str(sdir),
                     SMARTCOMP_SESSION_NAME=name,
-                    SMARTCOMP_SCREEN_GUARD="0")
+                    SMARTCOMP_HOST_LOCK_GATE="0")
         if cursor_theme:
             cenv["XCURSOR_THEME"] = cursor_theme
             cenv["XCURSOR_SIZE"] = "32"

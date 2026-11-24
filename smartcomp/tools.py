@@ -22,7 +22,7 @@ from . import apps as apps_mod
 from . import config
 from . import lock as lock_mod
 from .apps import APP_ALLOWLIST
-from .awake import Awake
+from .display import Display
 from .input import Input, InputError, MAX_SCROLL_TICKS, launch
 from .memory import Memory
 from .perception import Perception
@@ -417,13 +417,15 @@ _ACTIONS_NEEDING_SCREEN = frozenset({
     "screen_state", "screenshot", "describe_screen", "explain_screen",
     "popups", "watch_popups",
     # input: XTEST events go to the lock screen's grab while locked
-    "context_menu", "click_element", "drag_element", "scroll", "type_text",
-    "key", "key_down", "key_up",
+    "context_menu", "click_element", "drag_element", "draw_stroke", "scroll",
+    "type_text", "key", "key_down", "key_up",
 })
 # Window management (list/focus/move/close/launch) and the clipboard are
-# deliberately NOT guarded: they work through a lock over EWMH/selections,
-# which is exactly the background behaviour other desktop-control stacks
-# keep while the screen is locked.
+# deliberately NOT gated: they work through a lock over EWMH/selections, and
+# they cannot type into the lock screen.
+#
+# When the host is locked these tools return ok:false + locked:true instead of
+# acting. Nothing is woken or unlocked -- a session display is the answer.
 
 
 # Set by register() so _report_delta can include newly-appeared windows in
@@ -432,23 +434,26 @@ _WINS: Windows | None = None
 
 
 def register(mcp, perception: Perception, inp: Input, wins: Windows, memory: Memory,
-             awake: Awake | None = None) -> None:
+             display: Display | None = None) -> None:
     global _WINS
     _WINS = wins
     registry: dict[str, callable] = {}
-    awake = awake or Awake()
+    display = display or Display()
 
     def tool(fn):
         @functools.wraps(fn)
         def wrapper(*args, **kwargs):
             start = time.perf_counter()
             try:
-                if fn.__name__ in _ACTIONS_NEEDING_SCREEN:
-                    # CUA-style background operation: a screen that locked or
-                    # blanked since the last action is woken and released
-                    # here, so the requested work runs instead of typing into
-                    # the lock. Returns quickly when the screen is usable.
-                    lock_mod.ensure_screen(awake)
+                blocked = (lock_mod.blocked_reason()
+                           if fn.__name__ in _ACTIONS_NEEDING_SCREEN else None)
+                if blocked:
+                    # Read-only refusal: the host lock is the user's. A
+                    # session display (own X server) is how work continues.
+                    memory.log(fn.__name__, kwargs, False,
+                               (time.perf_counter() - start) * 1000,
+                               error="host display locked")
+                    return {"ok": False, **blocked}
                 result = fn(*args, **kwargs)
                 ok = not (isinstance(result, dict) and (result.get("ok") is False
                                                         or result.get("error")))
@@ -768,90 +773,38 @@ def register(mcp, perception: Perception, inp: Input, wins: Windows, memory: Mem
 
     @tool
     def health() -> dict:
-        """Report OCR engine, detector status, screen size, session and last timings."""
+        """Report OCR engine, detector status, screen size, session and timings."""
         return {
             "ok": True,
             "ocr": perception.ocr.engine,
             "detector": "ready" if perception.detector.ready else perception.detector.error,
             "screen": list(perception.capturer.native_size),
             "session": memory.session,
-            "awake": awake.status(),
-            "locked": lock_mod.is_locked(),
+            "display": display.status(),
+            "locked": lock_mod.lock_state(),
             "stats": perception.last_stats,
         }
 
-    # -- unattended operation ---------------------------------------------
-    @tool
-    def keep_awake(enable: bool = True, reason: str = "agent session") -> dict:
-        """Opt-in always-awake mode: inhibit the idle lock and DPMS blanking.
-
-        Off by default -- the box keeps its normal lock/blank behaviour and
-        every screen-touching action recovers the screen itself
-        (lock.ensure_screen). Enable this only for a long critical task that
-        must never be interrupted: the DBus screensaver inhibit is held
-        until disabled or the daemon stops, and the previous xset timeouts
-        are restored. It does NOT change the lid policy -- see lid_lock.
-        """
-        if enable:
-            return awake.enable(reason)
-        return awake.disable()
-
-    @tool
-    def lid_lock(on: bool = True, confirm: bool = False) -> dict:
-        """Control whether closing the laptop lid locks the screen.
-
-        on=True restores the stock xfce4-power-manager behaviour
-        (LID_TRIGGER_LOCK_SCREEN). on=False sets the lid trigger to NOTHING
-        so a closed lid neither locks nor sleeps the box -- useful for long
-        unattended runs, at the cost of the lid's normal locking. The
-        previous values are recorded and put back exactly.
-
-        Disabling the lid lock removes the last lock on lid close, so it is
-        refused without confirm=true; session_end restores the stock policy
-        by default.
-        """
-        if on:
-            return awake.restore_lock_policy()
-        if not confirm:
-            return {
-                "ok": False,
-                "error": "refusing to disable the lid lock without confirm=true; "
-                         "it is the last lock left on lid close",
-            }
-        return awake.apply_lock_policy()
-
-    @tool
-    def wake() -> dict:
-        """Wake a DPMS-blanked display and reset the idle timer (never unlocks)."""
-        return awake.wake_display()
-
+    # -- lock state (read-only) -------------------------------------------
     @tool
     def lock_state() -> dict:
-        """Report whether the screensaver lock currently holds the screen.
+        """Report whether the host screen is locked or blanked. Read-only.
 
-        True = locked (pointer and keyboard are captured by the lock screen;
-        type/click into it is pointless until unlock_screen runs), False =
-        desktop is usable, None-detection is reported as unknown. Also says
-        whether a recovery credential is available as a fallback.
+        SmartComp never unlocks the screen, wakes a blanked monitor or holds
+        a screensaver inhibit, so this is the whole "lock handling" surface.
+        When the host display is locked, screen-touching tools return
+        ok:false + locked:true and leave the lock screen alone; work that
+        must continue runs on a session display (session_create), whose own
+        X server is unaffected by the host lock.
         """
-        locked = lock_mod.is_locked()
+        disp = display.status()
         return {
-            "locked": locked,
-            "credential_available": lock_mod.credential_available(),
+            "locked": lock_mod.lock_state(refresh=True),
+            "blank": disp.get("display_blank"),
+            "display": disp.get("display"),
+            "isolated": lock_mod.host_display_isolated(),
+            "would_block": lock_mod.blocked_reason() is not None,
         }
-
-    @tool
-    def unlock_screen(retries: int = 2) -> dict:
-        """Recover from a screen lock on demand, with no password needed.
-
-        Same recovery the action guard runs automatically: asks the
-        screensaver to deactivate over its own documented DBus API (verified
-        live: xfce4-screensaver hands the screen back immediately). If a
-        locker refuses deactivation, falls back to typing the login password
-        held in ~/.local/state/smartcomp/unlock (mode 0600, created by the
-        user) -- the password never crosses the tool API or logs.
-        """
-        return lock_mod.unlock(inp, awake=awake, attempts=retries)
 
     # -- pointer ----------------------------------------------------------
     @tool
@@ -1516,7 +1469,6 @@ def register(mcp, perception: Perception, inp: Input, wins: Windows, memory: Mem
         means a smarter, faster daemon. A no-op when there was nothing
         worth distilling.
         """
-        lid = awake.restore_lock_policy()
         # Distil BEFORE end_session rotates the session id -- otherwise the
         # skill is built from the NEW (empty) session and always fails.
         distilled = None
@@ -1531,7 +1483,7 @@ def register(mcp, perception: Perception, inp: Input, wins: Windows, memory: Mem
         from . import ownership as own
 
         released = own.release_all()
-        result = {"ok": True, "lid_policy": lid, **memory.end_session(note),
+        result = {"ok": True, **memory.end_session(note),
                   "apps_released": released.get("released", [])}
         if distilled is not None:
             result["skill"] = distilled

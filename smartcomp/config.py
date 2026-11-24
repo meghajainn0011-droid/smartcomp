@@ -67,24 +67,20 @@ MCP_HOST = "127.0.0.1"
 # 8791 rather than the usual 8765: that port belongs to the user's browserd here.
 MCP_PORT = int(os.environ.get("SMARTCOMP_PORT", "8791"))
 
-# Unattended behaviour is opt-in now: the daemon does NOT inhibit the
-# screensaver or change the lid policy by default, so the box locks and
-# blanks exactly as the user configured it. Instead, every screen-touching
-# tool carries a recovery guard (lock.ensure_screen): when work is
-# requested, a locked/blanked screen is woken and released autonomously
-# (verified live: xfce4-screensaver hands the screen back to SetActive
-# deactivation with no password), the action runs, and the system returns
-# to its normal idle behaviour afterwards. SMARTCOMP_AWAKE=1 opts into the
-# old always-awake inhibit for long critical tasks.
-def awake_default_enabled() -> bool:
-    return os.environ.get("SMARTCOMP_AWAKE", "0") not in ("", "0", "false", "no")
-
-
-# The recovery guard itself: SMARTCOMP_SCREEN_GUARD=0 turns off the
-# wake+unlock-before-action behaviour (the box then behaves purely stock
-# and tools refuse while locked instead of recovering).
-def screen_guard_enabled() -> bool:
-    return os.environ.get("SMARTCOMP_SCREEN_GUARD", "1") not in ("0", "false", "no")
+# The host's lock/blank policy belongs to the user. SmartComp never unlocks
+# the screen, never wakes a blanked monitor, never holds a screensaver
+# inhibit and never changes the lid policy -- not at startup, not before an
+# action, not as a fallback. A locked host display is REPORTED (see
+# lock.blocked_reason) and left alone: perception and XTEST input would land
+# on the lock screen, and typing there can put a password into the wrong
+# field. Work that must continue while the host is locked runs on a session
+# display, which has its own X server.
+#
+# SMARTCOMP_HOST_LOCK_GATE=0 disables the refusal for a daemon attached to a
+# display whose lock state is irrelevant. Session daemons are detected by
+# SMARTCOMP_SESSION_NAME and never need this flag.
+def host_lock_gate_enabled() -> bool:
+    return os.environ.get("SMARTCOMP_HOST_LOCK_GATE", "1") not in ("0", "false", "no")
 
 
 def state_dir() -> Path:

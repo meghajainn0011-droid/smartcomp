@@ -27,10 +27,10 @@ from smartcomp import sessions as sessions_mod  # noqa: E402
 from smartcomp import vision as vision_mod  # noqa: E402
 from smartcomp import skillbook as skillbook_mod  # noqa: E402
 from Xlib import XK  # noqa: E402  (keysym ground truth for alias tests)
-from smartcomp import awake as awake_mod  # noqa: E402
+from smartcomp import display as display_mod  # noqa: E402
 from smartcomp import input as input_mod  # noqa: E402
 from smartcomp import memory as memory_mod  # noqa: E402
-from smartcomp.awake import _parse_xset  # noqa: E402
+from smartcomp.display import _parse_xset  # noqa: E402
 from smartcomp import lock as lock_mod  # noqa: E402
 from smartcomp.capture import Capturer  # noqa: E402
 from smartcomp.detector import Detector  # noqa: E402
@@ -324,82 +324,76 @@ DPMS (Energy Star):
         self.assertNotIn("ss_timeout", state)
 
 
-class TestLockCredential(unittest.TestCase):
-    """The unlock credential must be readable only by its owner."""
+class TestHostLockGate(unittest.TestCase):
+    """A locked host is refused, never unlocked and never woken.
+
+    The daemon used to release the lock (ScreenSaver.SetActive) and force DPMS
+    on before every action -- that is how an agent unlocked the user's desktop
+    and kept it from locking. The gate is read-only: it reports, and the
+    caller moves the work to a session display.
+    """
 
     def setUp(self):
-        import tempfile
+        lock_mod._LOCK_CACHE = None
+        self.addCleanup(setattr, lock_mod, "_LOCK_CACHE", None)
 
-        self.dir = tempfile.mkdtemp(prefix="smartcomp-test-")
-        patcher = unittest.mock.patch.object(
-            lock_mod, "credential_path", lambda: Path(self.dir) / "unlock"
-        )
-        patcher.start()
-        self.addCleanup(patcher.stop)
+    def _reason(self, env: dict, locked: bool | None):
+        base = {"DISPLAY": ":0", "SMARTCOMP_SESSION_NAME": "",
+                "SMARTCOMP_HOST_LOCK_GATE": "1"}
+        with unittest.mock.patch.dict(os.environ, {**base, **env}, clear=False), \
+                unittest.mock.patch.object(lock_mod, "lock_state", return_value=locked):
+            return lock_mod.blocked_reason()
 
-    def _write(self, mode: int, text: str = "pw\n") -> Path:
-        p = Path(self.dir) / "unlock"
-        p.write_text(text)
-        p.chmod(mode)
-        return p
+    def test_locked_host_display_is_blocked(self):
+        reason = self._reason({}, True)
+        self.assertIsNotNone(reason)
+        self.assertTrue(reason["locked"])
+        self.assertIn("never unlocks", reason["error"])
+        self.assertIn("session_create", reason["hint"])
 
-    def test_owner_only_file_is_accepted(self):
-        self._write(0o600)
-        self.assertEqual(lock_mod.read_credential(), "pw")
+    def test_unlocked_host_display_is_allowed(self):
+        self.assertIsNone(self._reason({}, False))
+        self.assertIsNone(self._reason({}, None))  # undetectable: do not block
 
-    def test_group_or_world_readable_is_refused(self):
-        self._write(0o644)
-        self.assertIsNone(lock_mod.read_credential())
-        self._write(0o640)
-        self.assertIsNone(lock_mod.read_credential())
+    def test_session_display_is_never_blocked(self):
+        self.assertIsNone(self._reason({"SMARTCOMP_SESSION_NAME": "alpha"}, True))
 
-    def test_missing_or_empty_file_is_refused(self):
-        self.assertIsNone(lock_mod.read_credential())
-        self._write(0o600, text="   \n")
-        self.assertIsNone(lock_mod.read_credential())
+    def test_gate_can_be_disabled_explicitly(self):
+        self.assertIsNone(self._reason({"SMARTCOMP_HOST_LOCK_GATE": "0"}, True))
 
-    def test_availability_matches_readability(self):
-        self.assertFalse(lock_mod.credential_available())
-        self._write(0o600)
-        self.assertTrue(lock_mod.credential_available())
+    def test_gate_never_runs_a_command(self):
+        # A refusal must not wake, inhibit or unlock: no subprocess at all.
+        with unittest.mock.patch.dict(os.environ, {"DISPLAY": ":0",
+                                                   "SMARTCOMP_SESSION_NAME": ""}), \
+                unittest.mock.patch.object(lock_mod, "lock_state", return_value=True), \
+                unittest.mock.patch.object(lock_mod, "is_locked", return_value=True), \
+                unittest.mock.patch("subprocess.run") as run:
+            self.assertIsNotNone(lock_mod.blocked_reason())
+        run.assert_not_called()
 
 
-class TestLidPolicy(unittest.TestCase):
-    """The xfpm lid trigger must round-trip: nothing on, originals back."""
+class TestNoHostLockMutation(unittest.TestCase):
+    """Regression guard: the lock/blank surface must stay read-only.
 
-    def test_lid_nothing_is_the_documented_enum(self):
-        # xfpm-enum-glib.h: DPMS=0, SUSPEND=1, HIBERNATE=2, LOCK_SCREEN=3,
-        # NOTHING=4. The stock default is LOCK_SCREEN (3), which is what
-        # locked this box on lid close; the unattended policy must set 4.
-        from smartcomp.awake import LID_TRIGGER_NOTHING
+    The removed API is the point. If unlock, hard_unlock, ensure_screen,
+    wake_display, inhibit or a lid-policy writer comes back, an action can
+    silently take the user's lock away again.
+    """
 
-        self.assertEqual(LID_TRIGGER_NOTHING, 4)
+    def test_lock_module_has_no_unlock_api(self):
+        for gone in ("unlock", "hard_unlock", "ensure_screen", "credential_path",
+                     "read_credential", "credential_available"):
+            self.assertFalse(hasattr(lock_mod, gone), gone)
 
-    def test_snapshot_handles_unset_properties(self):
-        with unittest.mock.patch.object(
-            awake_mod, "_xfconf_lid", lambda prop: None
-        ):
-            snap = awake_mod._lid_policy_snapshot()
-        self.assertEqual(
-            snap,
-            {
-                "/xfce4-power-manager/lid-action-on-ac": None,
-                "/xfce4-power-manager/lid-action-on-battery": None,
-            },
-        )
+    def test_display_module_only_reads(self):
+        disp = display_mod.Display()
+        for gone in ("wake_display", "enable", "disable", "apply_lock_policy",
+                     "restore_lock_policy", "reassert"):
+            self.assertFalse(hasattr(disp, gone), gone)
 
-    def test_set_uses_create_flag(self):
-        recorded = {}
-
-        def fake_run(args, **kwargs):
-            recorded["args"] = args
-            return subprocess.CompletedProcess(args, 0)
-
-        with unittest.mock.patch.object(awake_mod.subprocess, "run", fake_run):
-            ok = awake_mod._xfconf_set_lid("/xfce4-power-manager/lid-action-on-ac", "4")
-        self.assertTrue(ok)
-        self.assertIn("-n", recorded["args"])
-        self.assertEqual(recorded["args"][-2:], ["-s", "4"])
+    def test_awake_module_is_gone(self):
+        with self.assertRaises(ImportError):
+            __import__("smartcomp.awake")
 
 
 class TestMemoryErrorLog(unittest.TestCase):
@@ -1274,7 +1268,7 @@ class TestCloseWindowReport(unittest.TestCase):
         self.wins.close.return_value = {"ok": True}
         registry = tools_mod.register(
             mcp, self.perception, unittest.mock.Mock(), self.wins,
-            unittest.mock.Mock(), awake=unittest.mock.Mock())
+            unittest.mock.Mock(), display=unittest.mock.Mock())
         self.close_window = registry["close_window"]
 
     def test_dialog_arrives_in_the_close_result(self):
@@ -1606,10 +1600,11 @@ class TestToolSurface(unittest.TestCase):
     def setUp(self):
         mcp = unittest.mock.Mock()
         mcp.tool.return_value = lambda fn: fn  # registration is a no-op here
+        self.perception = unittest.mock.Mock()
         self.registry = tools_mod.register(
-            mcp, unittest.mock.Mock(), unittest.mock.Mock(),
+            mcp, self.perception, unittest.mock.Mock(),
             unittest.mock.Mock(), unittest.mock.Mock(),
-            awake=unittest.mock.Mock())
+            display=unittest.mock.Mock())
 
     def test_context_menu_is_element_addressed(self):
         self.assertNotIn("x", self.registry["context_menu"].__code__.co_varnames)
@@ -1620,16 +1615,39 @@ class TestToolSurface(unittest.TestCase):
                      "mouse_up", "drag"]:
             self.assertNotIn(gone, self.registry, gone)
 
+    def test_lock_mutation_tools_are_gone(self):
+        for gone in ["unlock_screen", "keep_awake", "lid_lock", "wake"]:
+            self.assertNotIn(gone, self.registry, gone)
+        self.assertIn("lock_state", self.registry)
+
+    def test_locked_host_refuses_without_touching_the_screen(self):
+        blocked = {"error": "host display is locked", "locked": True,
+                   "hint": "use session_create"}
+        with unittest.mock.patch.object(lock_mod, "blocked_reason",
+                                        return_value=blocked):
+            out = self.registry["screen_state"]()
+        self.assertFalse(out["ok"])
+        self.assertTrue(out["locked"])
+        self.perception.get_changes.assert_not_called()
+
+    def test_window_management_is_not_gated(self):
+        # EWMH/selections work while locked and cannot type into the lock
+        # screen, so these stay available on a locked host.
+        for name in ("list_windows", "move_window", "close_window",
+                     "launch_app", "app_status", "session_create"):
+            self.assertNotIn(name, tools_mod._ACTIONS_NEEDING_SCREEN)
+
     def test_deliberate_and_describing_tools_present(self):
         for present in ["context_menu", "describe_screen", "click_element",
-                        "type_text", "scroll", "drag_element"]:
+                        "type_text", "scroll", "drag_element", "draw_stroke"]:
             self.assertIn(present, self.registry, present)
 
     def test_describe_screen_needs_a_usable_screen(self):
-        # It reads pixels for the palette; under a lock it must be recovered
-        # like every other screen-touching tool, not typed into the lock.
+        # It reads pixels for the palette; on a locked host it must refuse
+        # rather than read the lock screen or wake the display.
         self.assertIn("describe_screen", tools_mod._ACTIONS_NEEDING_SCREEN)
         self.assertIn("context_menu", tools_mod._ACTIONS_NEEDING_SCREEN)
+        self.assertIn("draw_stroke", tools_mod._ACTIONS_NEEDING_SCREEN)
 
 
 class TestLaunchDetachment(unittest.TestCase):

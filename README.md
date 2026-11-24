@@ -580,46 +580,34 @@ The venv is created with `--system-site-packages` because numpy, onnxruntime,
 mss, OpenCV, httpx and `mcp` are already installed for the system python; only
 `pystray` is added.
 
-## Unattended operation (locked or unlocked)
+## Locked, blanked or asleep (the host is never touched)
 
-The daemon is built to keep an agent's work going with no human at the machine
-— locked screen or not. It rests on three mechanisms, all verified live on this
-box:
+SmartComp does **not** unlock the screen, wake a blanked monitor, hold a
+screensaver inhibit or change the lid policy. The host locks and blanks
+exactly as you configured it, whether an agent is running or not. There is no
+unlock tool and no stored password: "working through a lock" by taking the
+lock away is the wrong trade, and typing a login password into whatever has
+the keyboard is worse.
 
-| Piece | What it does |
+What happens instead:
+
+| Situation | Behaviour |
 |---|---|
-| `keep_awake` inhibit | DBus `ScreenSaver.Inhibit` stops the *idle* lock, and `xset` turns off DPMS blanking + the X screensaver timeout for the daemon's lifetime. Enabled automatically at daemon start; `SMARTCOMP_AWAKE=0` opts out. Crash-safe: the inhibit is owned by the daemon's bus connection, so it dies with the process. |
-| Lid policy (`apply_lock_policy`) | xfce4-power-manager's stock lid trigger is `LID_TRIGGER_LOCK_SCREEN` (enum value 3, per `xfpm-enum-glib.h`) — and per the Xfce docs a Lock call "bypasses all Inhibit requests", which is exactly how a closed lid locked this box mid-run. The daemon moves both `lid-action-on-ac/on-battery` to `4` (NOTHING), records the previous values in `~/.local/state/smartcomp/lid_policy.json`, and restores them when unattended mode is disabled. The tool side is consent-gated: `lid_lock(on=false)` without `confirm=true` is refused (it removes the last lock on lid close), and `session_end` restores the stock policy by default. |
-| Lock watchdog | A daemon thread checks every ~15 s: if a lock appears anyway (manual Lock, a lid event, a second locker) it releases it via `lock.hard_unlock()` and re-asserts the xset state (xfpm re-enables DPMS on lid events). Recovery is logged to the service log. |
-| `unlock_screen` | On-demand recovery: asks the screensaver to deactivate over its own documented DBus API — verified live: xfce4-screensaver hands the screen back with **no password and nothing typed**. If a locker refuses deactivation, it falls back to typing a user-stored credential (below). |
-| `wake` / `lock_state` | Force a DPMS-blanked display back on (never unlocks) / report whether a lock currently holds the screen (also in `health`). |
+| Host display locked | Screen-touching tools (`click_element`, `type_text`, `screen_state`, `popups`, `draw_stroke`, …) return `ok:false, locked:true` plus a hint. Nothing is woken, nothing is typed into the lock prompt, and the lock stays up. |
+| Host display blanked (DPMS) | Nothing is forced on. The framebuffer is still readable, so perception works; `health.display.display_blank` reports the monitor state. |
+| Work must continue while locked | `session_create(name)` gives the agent its own X server. Its XTEST input and captures never reach the host's lock screen, so the agent keeps working in the background — the same path other computer-use stacks use. |
+| `lock_state` | Read-only report: `locked`, `blank`, `display`, `isolated`, `would_block`. |
 
-**Why recovery needs no password here.** The lock on this desktop is held by
-xfce4-screensaver, which implements `SetActive(FALSE)` as "deactivate" — the
-same call `xfce4-screensaver-command --deactivate` makes. Live test
-(2026-11-16): screen locked via `SetActive(true)` → watchdog released it in
-≤10 s via `SetActive(false)` on `org.xfce.ScreenSaver /org/xfce/ScreenSaver`,
-desktop and all windows intact. The credential path exists for lock
-implementations that refuse deactivation (light-locker, PAM-verified states).
+The gate is per-daemon: a session daemon carries `SMARTCOMP_SESSION_NAME`, so
+it is exempt (its display has no lock). `SMARTCOMP_HOST_LOCK_GATE=0` is the
+explicit escape hatch for an operator attaching the daemon to a display whose
+lock state is irrelevant.
 
-**Optional stored credential.** Only needed as a fallback; created by you, the
-password never crosses the tool API and is never logged:
-
-```bash
-install -m 600 /dev/null ~/.local/state/smartcomp/unlock
-# then edit that file to hold your login password (single line)
-```
-
-A file that is group- or world-readable is refused outright rather than used.
-
-**Security trade-off, stated plainly.** While the daemon runs unattended, the
-desktop does not stay locked: idle locking is inhibited, the lid no longer
-locks, and any lock that does appear is released within seconds. That is the
-point of the feature — an agent that must keep working with no human present —
-but it means the machine effectively runs unlocked. Stop the daemon
-(`systemctl --user stop smartcomp.service`) or `keep_awake(false)` to return to
-normal behaviour: the inhibit releases, the lid policy is restored, and the
-screensaver behaves stock again.
+Verified by construction and by test: `smartcomp/display.py` runs only
+`xset q` (read), `smartcomp/lock.py` only reads `ScreenSaver.GetActive`, and
+unit tests assert that the removed API stays removed (`unlock`, `hard_unlock`,
+`ensure_screen`, `wake_display`, `enable`, lid-policy writers) and that a
+locked-host refusal runs **no subprocess at all**.
 
 ## Layout
 
@@ -630,8 +618,8 @@ screensaver behaves stock again.
 | `smartcomp/detector.py` | GPA ONNX decode (letterbox, NMS, transpose-safe) |
 | `smartcomp/perception.py` | region clustering, element ids, delta JSON |
 | `smartcomp/apps.py` | app census, launch resume semantics, Firefox tab counts |
-| `smartcomp/awake.py` | screensaver inhibit + DPMS control for unattended runs |
-| `smartcomp/lock.py` | lock-state detection + credential-based unlock recovery |
+| `smartcomp/display.py` | read-only display status (`xset q`); no inhibit, no wake |
+| `smartcomp/lock.py` | read-only lock detection + the locked-host gate |
 | `smartcomp/sessions.py` | private Xvfb/Xephyr desktop per agent, daemon + token per session |
 | `smartcomp/mpx.py` | multi-pointer X wrapper (own cursor per master); unused, see above |
 | `smartcomp/server.py` | FastMCP streamable HTTP + bearer middleware |

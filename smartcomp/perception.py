@@ -227,7 +227,18 @@ class Perception:
                 _permille(line.w, native_w),
                 _permille(line.h, native_h),
             ]
-            out.append({"b": box, "x": line.text[:160], "c": round(line.conf / 100.0, 2)})
+            text = line.text[:160]
+            eid = _eid("t", box, text)
+            el = {
+                "id": eid,
+                "k": "t",
+                "b": box,
+                "x": text,
+                "c": round(line.conf / 100.0, 2),
+                "u": 1,
+            }
+            self.elements[eid] = el
+            out.append(el)
         self.last_stats = {
             **(self.last_stats or {}),
             stats_key: round(self.ocr.last_ms, 1),
