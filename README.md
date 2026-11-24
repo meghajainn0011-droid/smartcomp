@@ -482,7 +482,7 @@ cd /home/damon/smartcomp
 .venv/bin/python -m smartcomp.daemon once       # one JSON pass
 .venv/bin/python -m smartcomp.daemon bench      # T3/T4/T5 measurement
 .venv/bin/python tests/mcp_smoke.py             # end-to-end MCP client
-.venv/bin/python scripts/mcp_compat.py          # client-dialect matrix (24 checks)
+.venv/bin/python scripts/mcp_compat.py          # client-dialect matrix (26 checks)
 .venv/bin/python -m unittest discover -s tests  # unit tests
 ```
 
@@ -546,7 +546,7 @@ the CLI rather than editing that file by hand.
 
 Real agents are not identical MCP clients, and each deviation used to surface
 as an error the caller could not interpret. `scripts/mcp_compat.py` starts a
-throwaway daemon and checks the whole matrix — **24/24 pass** today:
+throwaway daemon and checks the whole matrix — **26/26 pass** today:
 
 | Behaviour | Before | Now |
 |---|---|---|
@@ -555,6 +555,7 @@ throwaway daemon and checks the whole matrix — **24/24 pass** today:
 | client sending only `Accept: application/json` (no SSE) | `406 Not Acceptable` | JSON response |
 | `Accept: */*` or no `Accept` at all | treated as JSON-only by the new code | normal SSE reply |
 | sessionless `GET /mcp` (SSE probe) | `400` | `405` as the spec defines |
+| `GET` with an unknown session id | created a stream and held the session lock for its life | `405`; no transport is created, and the next POST answers |
 | unknown tool / missing arguments | — | JSON-RPC error / `isError`, never a crash |
 | `initialize` with 2024-11-05 … 2025-11-25 | — | all negotiated and accepted |
 | `MCP-Protocol-Version` echoed back | — | accepted for every supported version |

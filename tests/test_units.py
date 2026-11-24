@@ -5,6 +5,8 @@ Run with: .venv/bin/python -m unittest discover -s tests -p 'test_*.py'
 
 from __future__ import annotations
 
+import asyncio
+import json
 import subprocess
 import os
 import sys
@@ -1364,6 +1366,24 @@ class TestSkillbook(unittest.TestCase):
         self.assertGreaterEqual(out["steps"], 2)
 
 
+class TestSessionReap(unittest.TestCase):
+    """Closing a session must not leave a zombie per child process.
+
+    Xvfb/WM/session-daemon are children of the daemon; SIGTERM without
+    waitpid parks each one as <defunct> for the daemon's whole lifetime.
+    """
+
+    def test_killed_child_is_reaped(self):
+        proc = subprocess.Popen(["sleep", "30"])
+        os.kill(proc.pid, 15)
+        sessions_mod._reap(proc.pid)
+        self.assertFalse(Path(f"/proc/{proc.pid}").exists())
+        proc.returncode = 0  # already reaped; keep Popen from waiting again
+
+    def test_non_child_pid_is_a_noop(self):
+        sessions_mod._reap(999_999_999, timeout=0.1)  # must not raise
+
+
 class TestSessionManager(unittest.TestCase):
     """Per-session virtual displays: own cursor, shared training/memory."""
 
@@ -1592,6 +1612,86 @@ class TestVisionDecider(unittest.TestCase):
         v = vision_mod.decide("alpha beta gamma", ["alpha beta gamma delta epsilon"])
         self.assertEqual(v["decided"], "mirage")
         self.assertIn("3/5", v["why"])
+
+
+class TestHttpDialectRouting(unittest.TestCase):
+    """Transport routing must never park a lock behind a client-held stream.
+
+    Live failure this guards (2026-11-24): a client reconnecting after a daemon
+    restart sent GET with its old session id. The handler adopted that id,
+    created a transport, and awaited the SSE response INSIDE
+    `_session_creation_lock`, so the lock was held for the life of the stream.
+    Every later POST waited on it and never reached the app (GET still
+    answered, which made it look like a partial outage). Reproduced
+    deterministically by one GET with an unknown id, then a POST.
+    """
+
+    def setUp(self):
+        import mcp.server.streamable_http_manager as mcp_sm
+
+        from smartcomp import server as server_mod
+
+        server_mod._install_resilient_session_handler()
+        self.sm = mcp_sm
+        self.manager = mcp_sm.StreamableHTTPSessionManager(app=unittest.mock.Mock())
+        self.manager._task_group = None  # not started yet: the startup window
+        self.handler = mcp_sm.StreamableHTTPSessionManager._handle_stateful_request
+
+    def _run(self, method: str, headers: list[tuple[bytes, bytes]], body: bytes = b""):
+        scope = {
+            "type": "http",
+            "method": method,
+            "path": "/mcp",
+            "headers": headers,
+            "query_string": b"",
+            "http_version": "1.1",
+            "scheme": "http",
+            "server": ("127.0.0.1", 8791),
+            "client": ("127.0.0.1", 55555),
+            "root_path": "",
+        }
+        sent: list[dict] = []
+
+        async def receive():
+            return {"type": "http.request", "body": body, "more_body": False}
+
+        async def send(message):
+            sent.append(message)
+
+        async def go():
+            await self.handler(self.manager, scope, receive, send)
+
+        # A hang here is the bug: bound it so a regression fails instead of
+        # stalling the whole test run.
+        asyncio.run(asyncio.wait_for(go(), 5))
+        return sent
+
+    def _status(self, sent: list[dict]) -> int:
+        starts = [m for m in sent if m["type"] == "http.response.start"]
+        self.assertTrue(starts, "no response was started")
+        return starts[0]["status"]
+
+    def test_stale_session_get_is_refused_without_creating_a_transport(self):
+        sent = self._run("GET", [(b"mcp-session-id", b"deadbeef" * 4),
+                                 (b"accept", b"text/event-stream")])
+        self.assertEqual(self._status(sent), 405)
+        self.assertEqual(self.manager._server_instances, {})
+
+    def test_sessionless_get_is_405(self):
+        sent = self._run("GET", [(b"accept", b"text/event-stream")])
+        self.assertEqual(self._status(sent), 405)
+        self.assertEqual(self.manager._server_instances, {})
+
+    def test_post_before_lifespan_answers_503_instead_of_stalling(self):
+        sent = self._run(
+            "POST",
+            [(b"content-type", b"application/json"),
+             (b"accept", b"application/json, text/event-stream")],
+            body=json.dumps({"jsonrpc": "2.0", "id": 1, "method": "initialize",
+                             "params": {}}).encode(),
+        )
+        self.assertEqual(self._status(sent), 503)
+        self.assertEqual(self.manager._server_instances, {})
 
 
 class TestToolSurface(unittest.TestCase):

@@ -31,6 +31,35 @@ log = logging.getLogger("smartcomp.sessions")
 
 _DISPLAY_BASE = 1000          # avoid host :0-:2 and the CI convention :99
 _GEOMETRY = "1920x1080x24"
+
+
+def _reap(pid: int, timeout: float = 5.0) -> None:
+    """Wait for a killed session child so it cannot linger as a zombie.
+
+    Xvfb, the session WM and the session daemon are children of THIS process.
+    Sending SIGTERM without waitpid leaves one zombie per closed session -- a
+    PID slot that can never be reused while the daemon lives. If the pid is
+    not our child (the daemon restarted and init inherited it), waitpid raises
+    ECHILD and there is nothing to reap.
+    """
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            done, _ = os.waitpid(pid, os.WNOHANG)
+        except ChildProcessError:
+            return
+        except OSError:
+            return
+        if done == pid:
+            return
+        time.sleep(0.05)
+    try:  # ignored SIGTERM: make sure it dies, then take the status
+        os.kill(pid, 9)
+        os.waitpid(pid, 0)
+    except OSError:
+        pass
+
+
 _PORT_BASE_OFFSET = 1         # main daemon is config.MCP_PORT; sessions follow
 _HEALTH_TIMEOUT = 40.0        # detector load on this 2-core box is ~20 s
 
@@ -308,6 +337,7 @@ class SessionManager:
                     os.kill(pid, 15)
                 except OSError:
                     pass
+            _reap(pid)
         self._save(reg)
         return {"ok": True, "closed": name, "apps_killed": killed}
 

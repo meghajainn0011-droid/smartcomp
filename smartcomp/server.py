@@ -188,6 +188,18 @@ def _install_resilient_session_handler() -> None:
     rejected), requests with neither session nor ``initialize`` are served
     statelessly, JSON-only clients get JSON responses, and a sessionless GET is
     answered 405 instead of 400.
+
+    Two rules keep this from wedging the daemon, both learned from live hangs:
+
+    * GET and DELETE never create a transport. A GET is "open a server->client
+      stream", and an SSE stream for an id nobody owns stays open for minutes.
+    * No lock spans a response stream. An adopted session used to be created
+      under ``_session_creation_lock`` and then served inside the same ``async
+      with``; one stale-session GET therefore held that lock for the life of
+      its stream and every later POST waited on it forever (reproduced: one
+      GET with an unknown id, then the next POST never arrived). Transport
+      creation and registration run on the event loop with no await between
+      check and write, so the lock was never needed for correctness.
     """
     try:
         import anyio
@@ -205,27 +217,43 @@ def _install_resilient_session_handler() -> None:
             method = scope.get("method", "")
             session_id = _header(scope, sm.MCP_SESSION_ID_HEADER)
             json_only = not _accepts_event_stream(_header(scope, "accept"))
+            live = self._server_instances.get(session_id) if session_id else None
 
             # A live session is handled by its own transport -- unless the
             # client asks for JSON only, which an SSE-mode transport cannot
             # answer (406). Those fall through to the stateless JSON path
             # below rather than failing a request the server can serve.
-            if session_id and session_id in self._server_instances and not json_only:
-                await self._server_instances[session_id].handle_request(scope, receive, send)
+            if live is not None and not json_only:
+                await live.handle_request(scope, receive, send)
                 return
 
-            if method == "GET" and not session_id:
-                # Nothing to resume and no server-initiated messages to push.
+            # GET is "open a server->client stream", so only a live session
+            # has anything to answer. An unknown or missing id is refused
+            # here: creating a transport for it would park an SSE stream --
+            # and anything held while serving it -- until the client leaves.
+            if method == "GET":
                 await _json_reply(
                     send, 405,
-                    "Method Not Allowed: GET needs an existing session id; POST JSON-RPC instead",
+                    "Method Not Allowed: GET needs a live session id; POST JSON-RPC instead",
                 )
                 return
-            if method not in ("GET", "POST", "DELETE"):
+            if method == "DELETE":
+                if live is None:
+                    await _json_reply(send, 404, "Session not found")
+                else:
+                    await live.handle_request(scope, receive, send)
+                return
+            if method != "POST":
                 await _json_reply(send, 405, f"Method Not Allowed: {method} on the MCP endpoint")
                 return
 
-            body = await _read_request_body(receive) if method == "POST" else b""
+            # The socket listens before the lifespan task group starts. Answer
+            # that window instead of asserting on None and confusing a probe.
+            if self._task_group is None:
+                await _json_reply(send, 503, "server is still starting; retry in a moment")
+                return
+
+            body = await _read_request_body(receive)
             rpc_method = None
             if body:
                 try:
@@ -246,46 +274,49 @@ def _install_resilient_session_handler() -> None:
             register = starts_session or keep_session
             require_handshake = starts_session
 
-            async with self._session_creation_lock:
-                new_session_id = session_id if keep_session else None
-                if starts_session and new_session_id is None:
-                    new_session_id = uuid4().hex
-                http_transport = sm.StreamableHTTPServerTransport(
-                    mcp_session_id=new_session_id,
-                    is_json_response_enabled=self.json_response or json_only,
-                    event_store=self.event_store if register else None,
-                    security_settings=self.security_settings,
-                    retry_interval=self.retry_interval,
-                )
-                if register and new_session_id:
-                    self._server_instances[new_session_id] = http_transport
+            # No lock: everything below up to the first await is a check plus
+            # a dict write on the event loop, and the await after it is a
+            # response stream whose length the client controls. Holding a lock
+            # across it is what wedged the daemon; a slow request must only
+            # stall itself.
+            new_session_id = session_id if keep_session else None
+            if starts_session and new_session_id is None:
+                new_session_id = uuid4().hex
+            http_transport = sm.StreamableHTTPServerTransport(
+                mcp_session_id=new_session_id,
+                is_json_response_enabled=self.json_response or json_only,
+                event_store=self.event_store if register else None,
+                security_settings=self.security_settings,
+                retry_interval=self.retry_interval,
+            )
+            if register and new_session_id:
+                self._server_instances[new_session_id] = http_transport
 
-                async def run_server(*, task_status: sm.TaskStatus[None] = anyio.TASK_STATUS_IGNORED):
-                    async with http_transport.connect() as streams:
-                        read_stream, write_stream = streams
-                        task_status.started()
-                        try:
-                            await self.app.run(
-                                read_stream,
-                                write_stream,
-                                self.app.create_initialization_options(),
-                                stateless=not require_handshake,
-                            )
-                        except Exception as e:
-                            sm.logger.error(
-                                "Session %s crashed: %s", http_transport.mcp_session_id, e,
-                                exc_info=True,
-                            )
-                        finally:
-                            sid = http_transport.mcp_session_id
-                            if sid and sid in self._server_instances and http_transport.is_terminated:
-                                del self._server_instances[sid]
+            async def run_server(*, task_status: sm.TaskStatus[None] = anyio.TASK_STATUS_IGNORED):
+                async with http_transport.connect() as streams:
+                    read_stream, write_stream = streams
+                    task_status.started()
+                    try:
+                        await self.app.run(
+                            read_stream,
+                            write_stream,
+                            self.app.create_initialization_options(),
+                            stateless=not require_handshake,
+                        )
+                    except Exception as e:
+                        sm.logger.error(
+                            "Session %s crashed: %s", http_transport.mcp_session_id, e,
+                            exc_info=True,
+                        )
+                    finally:
+                        sid = http_transport.mcp_session_id
+                        if sid and sid in self._server_instances and http_transport.is_terminated:
+                            del self._server_instances[sid]
 
-                assert self._task_group is not None
-                await self._task_group.start(run_server)
-                await http_transport.handle_request(scope, _replay_receive(body, receive), send)
-                if not register:
-                    await http_transport.terminate()
+            await self._task_group.start(run_server)
+            await http_transport.handle_request(scope, _replay_receive(body, receive), send)
+            if not register:
+                await http_transport.terminate()
 
         sm.StreamableHTTPSessionManager._handle_stateful_request = _resilient_handle_stateful_request
         sm.StreamableHTTPSessionManager._smartcomp_resilient_installed = True

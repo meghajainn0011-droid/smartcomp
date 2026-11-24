@@ -232,6 +232,23 @@ def main() -> int:
         ok_overall &= check(r.status_code == 405,
                             "sessionless GET probe -> 405 (not 400)", str(r.status_code))
 
+        # Regression: a GET for a session id nobody owns used to create a
+        # transport and hold the session-creation lock for the life of the SSE
+        # stream, so every later POST waited forever (the daemon looked "half
+        # alive": GET answered, POSTs never arrived). The id must be one the
+        # daemon has never adopted -- an earlier check replays "deadbeef...",
+        # which makes that id live, and a live-session GET is meant to stream.
+        r = httpx.get(f"{base}/mcp", headers={"Authorization": f"Bearer {TOKEN}",
+                                              "Accept": "text/event-stream",
+                                              "Mcp-Session-Id": "0" * 32}, timeout=3)
+        ok_overall &= check(r.status_code == 405,
+                            "GET with an unknown session id -> 405", str(r.status_code))
+        r = post(base, {"jsonrpc": "2.0", "id": 11, "method": "tools/list",
+                        "params": {}})
+        ok_overall &= check(r.status_code == 200,
+                            "POST after that GET still answers (no wedged lock)",
+                            str(r.status_code))
+
         r = post(base, {"jsonrpc": "2.0", "id": 12, "method": "tools/call",
                         "params": {"name": "screen_state", "arguments": {}}}, session=sess)
         size = len(r.text)
