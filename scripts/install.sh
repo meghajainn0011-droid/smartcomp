@@ -84,6 +84,12 @@ JSON
 chmod 600 "$STATE_DIR/mcp.json"
 echo "== endpoint file: $STATE_DIR/mcp.json (mode 600; the daemon rewrites it with the live tool list at every startup)"
 
+echo "== cli: smartcomp (start) | stop | restart | status | doctor"
+
+# 6. report the health of what was just installed; a warning here is a real
+#    diagnosis, not a reason to fail the install.
+"$BIN_DIR/smartcomp" doctor || true
+
 echo
 echo "Done. Any MCP agent can connect with:"
 echo "  url:     http://127.0.0.1:8791/mcp"

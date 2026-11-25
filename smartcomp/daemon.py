@@ -9,6 +9,7 @@ import sys
 import time
 
 from . import config
+from . import __version__
 
 
 def _once(args) -> int:
@@ -90,6 +91,36 @@ def _tray(args) -> int:
     return tray_main([])
 
 
+def _start(args) -> int:
+    from . import service
+
+    return service.start()
+
+
+def _stop(args) -> int:
+    from . import service
+
+    return service.stop()
+
+
+def _restart(args) -> int:
+    from . import service
+
+    return service.restart()
+
+
+def _status(args) -> int:
+    from . import service
+
+    return service.status()
+
+
+def _doctor(args) -> int:
+    from . import service
+
+    return service.print_doctor(service.doctor())
+
+
 def _state(args) -> int:
     from .perception import Perception
 
@@ -103,9 +134,25 @@ def main(argv: list[str] | None = None) -> int:
     common = argparse.ArgumentParser(add_help=False)
     common.add_argument("--display", default=None, help="X display, e.g. :0.0")
     parser = argparse.ArgumentParser(
-        prog="smartcomp", description="SmartComp perception daemon", parents=[common]
+        prog="smartcomp",
+        description="SmartComp desktop-control daemon. No command starts it.",
+        epilog="A locked host keeps working: screen tools run on the agent's "
+               "own display without unlocking, waking or inhibiting anything.",
     )
-    sub = parser.add_subparsers(dest="cmd", required=True)
+    parser.add_argument("--version", action="version", version=f"smartcomp {__version__}")
+    sub = parser.add_subparsers(dest="cmd")
+
+    p_start = sub.add_parser("start", help="start the daemon (the default)", parents=[common])
+    p_start.set_defaults(func=_start)
+    p_stop = sub.add_parser("stop", help="stop the daemon", parents=[common])
+    p_stop.set_defaults(func=_stop)
+    p_restart = sub.add_parser("restart", help="restart the daemon", parents=[common])
+    p_restart.set_defaults(func=_restart)
+    p_status = sub.add_parser("status", help="is it running, and where", parents=[common])
+    p_status.set_defaults(func=_status)
+    p_doctor = sub.add_parser("doctor", parents=[common],
+                              help="run health checks and explain failures")
+    p_doctor.set_defaults(func=_doctor)
 
     p_once = sub.add_parser("once", help="one perception pass as JSON", parents=[common])
     p_once.add_argument("--settle", type=float, default=0.0, help="seconds, then a second pass")
@@ -118,9 +165,8 @@ def main(argv: list[str] | None = None) -> int:
     p_bench.add_argument("--interval", type=float, default=1.5)
     p_bench.set_defaults(func=_bench)
 
-    sub.add_parser("serve", help="run the MCP HTTP server", parents=[common]).set_defaults(
-        func=_serve
-    )
+    sub.add_parser("serve", help="run the MCP HTTP server in the foreground", parents=[common]
+                   ).set_defaults(func=_serve)
     sub.add_parser("tray", help="run the panel tray icon", parents=[common]).set_defaults(
         func=_tray
     )
@@ -128,6 +174,9 @@ def main(argv: list[str] | None = None) -> int:
         func=_state
     )
 
+    argv = list(sys.argv[1:] if argv is None else argv)
+    if not argv or argv[0].startswith("-") and argv[0] not in ("--help", "-h", "--version"):
+        argv.insert(0, "start")
     args = parser.parse_args(argv)
     if args.display:
         import os

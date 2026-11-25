@@ -83,6 +83,32 @@ def host_lock_gate_enabled() -> bool:
     return os.environ.get("SMARTCOMP_HOST_LOCK_GATE", "1") not in ("0", "false", "no")
 
 
+# A locked host display cannot accept XTEST input (the lock owns the grab) and
+# its pixels are the lock screen, but work does not have to stop: screen tools
+# are re-run on the agent's own display while the lock is up, and the host is
+# left exactly as the user left it. This is the "uninterrupted through lock"
+# behaviour, implemented without unlocking anything.
+#
+# The session is created lazily on the first screen call that arrives while
+# locked (name "agent", headless Xvfb) and kept afterwards, so a later call
+# does not pay the ~10-20 s start cost again. session_close("agent") stops it;
+# the next locked call recreates it.
+AUTO_SESSION_NAME = "agent"
+
+# How long a screen tool may wait for the agent display to become ready on its
+# first locked call. The session daemon loads the detector after the port
+# opens, which is the slow part (measured 8-20 s on this 2-core box).
+AUTO_SESSION_WAIT = float(os.environ.get("SMARTCOMP_AUTO_SESSION_WAIT", "45"))
+
+
+def auto_session_enabled() -> bool:
+    return os.environ.get("SMARTCOMP_AUTO_SESSION", "1") not in ("0", "false", "no")
+
+
+# The CLI waits this long for a freshly started daemon to answer tools/list.
+START_TIMEOUT = float(os.environ.get("SMARTCOMP_START_TIMEOUT", "90"))
+
+
 def state_dir() -> Path:
     """Directory holding the local token, the SQLite store and logs."""
     base = Path(os.environ.get("SMARTCOMP_STATE_DIR", Path.home() / ".local" / "state" / APP_NAME))

@@ -11,6 +11,7 @@ into `{"ok": false, "error": ...}` instead of killing the transport.
 from __future__ import annotations
 
 import functools
+import inspect
 import os
 import json
 import time
@@ -420,12 +421,28 @@ _ACTIONS_NEEDING_SCREEN = frozenset({
     "context_menu", "click_element", "drag_element", "draw_stroke", "scroll",
     "type_text", "key", "key_down", "key_up",
 })
-# Window management (list/focus/move/close/launch) and the clipboard are
-# deliberately NOT gated: they work through a lock over EWMH/selections, and
-# they cannot type into the lock screen.
+# Window management (list/focus/move/close/launch) and the clipboard are NOT
+# part of this set: they reach the host over EWMH/selections and cannot type
+# into the lock screen. When the host is locked they are routed together with
+# the tools above (see _LOCAL_ONLY), so an agent that is working on its own
+# display can also start and inspect apps there.
 #
-# When the host is locked these tools return ok:false + locked:true instead of
-# acting. Nothing is woken or unlocked -- a session display is the answer.
+# Locked and the fallback is off: these tools return ok:false + locked:true.
+# Nothing is woken or unlocked either way.
+
+# Tools that belong to the daemon or the host, never to a desktop: session
+# management, memory, skills, media capture and the lock/health report itself.
+# Everything else operates a desktop, so while the host is locked it runs on
+# the agent's display; a new desktop tool is routed automatically.
+_LOCAL_ONLY = frozenset({
+    "health", "lock_state", "stats",
+    "session_create", "session_list", "session_close", "session_endpoint",
+    "session_align", "session_train", "session_end",
+    "remember", "recall", "run_skill", "skill_create", "learn_skill",
+    "forget_skill", "list_skills", "skill_learn_recent", "skills_install",
+    "media_understand", "media_listen", "media_watch", "media_audio_check",
+    "media_capabilities", "app_owners", "app_release",
+})
 
 
 # Set by register() so _report_delta can include newly-appeared windows in
@@ -440,20 +457,103 @@ def register(mcp, perception: Perception, inp: Input, wins: Windows, memory: Mem
     registry: dict[str, callable] = {}
     display = display or Display()
 
+    def _agent_display_call(fn, args, kwargs) -> tuple[dict | None, str | None]:
+        """Run a screen tool on the agent's own display while the host is locked.
+
+        The host lock cannot be bypassed -- XTEST input is delivered to the
+        lock's grab and the pixels are the lock screen -- so "keep working"
+        means "work somewhere the lock does not cover": a private Xvfb desktop
+        with its own daemon, created on demand and reused afterwards. The host
+        stays locked and untouched; the caller gets a normal tool result plus a
+        `routed` block saying which display answered.
+
+        Returns (result, None) or (None, why-not) so the caller can fall back
+        to the explicit locked refusal.
+        """
+        if not config.auto_session_enabled():
+            return None, "automatic agent display is off (SMARTCOMP_AUTO_SESSION=0)"
+        from . import rpc
+
+        name = config.AUTO_SESSION_NAME
+        try:
+            mgr = _sessions().manager()
+            existing = next((s for s in mgr.list() if s["name"] == name), None)
+            if existing is None or not existing.get("alive"):
+                if existing is not None:  # registry entry with dead processes
+                    mgr.close(name)
+                created = mgr.create(name, visible=False)
+                if not created.get("ok"):
+                    return None, str(created.get("error") or "could not create the agent display")
+
+            deadline = time.time() + config.AUTO_SESSION_WAIT
+            record = None
+            while time.time() < deadline:
+                record = next((s for s in mgr.list() if s["name"] == name), None)
+                if record and record.get("healthy"):
+                    break
+                time.sleep(0.5)
+            if not (record and record.get("healthy")):
+                return None, (f"agent display {name!r} did not become healthy in "
+                              f"{config.AUTO_SESSION_WAIT:.0f}s")
+
+            # Forward the caller's real arguments, defaults filled in, to the
+            # session daemon's own MCP endpoint.
+            bound = inspect.signature(fn).bind(*args, **kwargs)
+            bound.apply_defaults()
+            url, token = mgr.auth(name)
+            out = rpc.call_tool(url, token, fn.__name__, dict(bound.arguments),
+                                timeout=180.0)
+            out["routed"] = {
+                "session": name,
+                "display": record.get("display"),
+                "reason": "the host display is locked; it was left locked and "
+                          "this call ran on the agent's own display",
+            }
+            return out, None
+        except Exception as exc:  # never turn a fallback failure into a crash
+            return None, f"{type(exc).__name__}: {exc}"
+
     def tool(fn):
         @functools.wraps(fn)
         def wrapper(*args, **kwargs):
             start = time.perf_counter()
+            name = fn.__name__
             try:
-                blocked = (lock_mod.blocked_reason()
-                           if fn.__name__ in _ACTIONS_NEEDING_SCREEN else None)
-                if blocked:
-                    # Read-only refusal: the host lock is the user's. A
-                    # session display (own X server) is how work continues.
-                    memory.log(fn.__name__, kwargs, False,
-                               (time.perf_counter() - start) * 1000,
-                               error="host display locked")
-                    return {"ok": False, **blocked}
+                host_locked = (name not in _LOCAL_ONLY
+                               and not lock_mod.host_display_isolated()
+                               and lock_mod.lock_state() is True)
+                if host_locked:
+                    # The host lock is the user's: nothing is unlocked, woken
+                    # or inhibited. Work continues on the agent's own display.
+                    routed, route_error = _agent_display_call(fn, args, kwargs)
+                    if routed is not None:
+                        ok = not (routed.get("ok") is False or routed.get("error"))
+                        memory.log(name, kwargs, ok,
+                                   (time.perf_counter() - start) * 1000,
+                                   error=None if ok else str(routed.get("error"))[:200])
+                        return routed
+                    if name in _ACTIONS_NEEDING_SCREEN:
+                        blocked = lock_mod.blocked_reason() or {
+                            "error": "host display is locked",
+                            "locked": True,
+                            "hint": "screen tools cannot use a locked host display",
+                        }
+                        memory.log(name, kwargs, False,
+                                   (time.perf_counter() - start) * 1000,
+                                   error="host display locked; agent display unavailable")
+                        refusal = {"ok": False, **blocked}
+                        if route_error:
+                            refusal["route_error"] = route_error
+                        return refusal
+                    # launch_app/list_windows/clipboard still work through the
+                    # lock; the failure to route is reported by their own reply.
+                elif name in _ACTIONS_NEEDING_SCREEN:
+                    blocked = lock_mod.blocked_reason()
+                    if blocked:
+                        memory.log(name, kwargs, False,
+                                   (time.perf_counter() - start) * 1000,
+                                   error="host display locked")
+                        return {"ok": False, **blocked}
                 result = fn(*args, **kwargs)
                 ok = not (isinstance(result, dict) and (result.get("ok") is False
                                                         or result.get("error")))
@@ -774,6 +874,7 @@ def register(mcp, perception: Perception, inp: Input, wins: Windows, memory: Mem
     @tool
     def health() -> dict:
         """Report OCR engine, detector status, screen size, session and timings."""
+        locked = lock_mod.lock_state()
         return {
             "ok": True,
             "ocr": perception.ocr.engine,
@@ -781,29 +882,38 @@ def register(mcp, perception: Perception, inp: Input, wins: Windows, memory: Mem
             "screen": list(perception.capturer.native_size),
             "session": memory.session,
             "display": display.status(),
-            "locked": lock_mod.lock_state(),
+            "locked": locked,
+            "route": ("agent display" if locked and config.auto_session_enabled()
+                      and not lock_mod.host_display_isolated() else "host"),
             "stats": perception.last_stats,
         }
 
     # -- lock state (read-only) -------------------------------------------
     @tool
     def lock_state() -> dict:
-        """Report whether the host screen is locked or blanked. Read-only.
+        """Report lock/blank state and where screen tools will run. Read-only.
 
-        SmartComp never unlocks the screen, wakes a blanked monitor or holds
-        a screensaver inhibit, so this is the whole "lock handling" surface.
-        When the host display is locked, screen-touching tools return
-        ok:false + locked:true and leave the lock screen alone; work that
-        must continue runs on a session display (session_create), whose own
-        X server is unaffected by the host lock.
+        SmartComp never unlocks, wakes or inhibits anything: the host keeps
+        exactly the lock the user gave it. While it is locked, screen tools
+        run on the agent's own display (`route: "agent display"`) instead of
+        failing, so work continues and the lock stays up. `blank` is the
+        monitor's DPMS state: a blanked monitor does not stop the daemon or
+        the captures (only a lock blocks input), and nothing here forces it
+        back on.
         """
         disp = display.status()
+        locked = lock_mod.lock_state(refresh=True)
+        isolated = lock_mod.host_display_isolated()
+        auto = config.auto_session_enabled() and not isolated
         return {
-            "locked": lock_mod.lock_state(refresh=True),
+            "locked": locked,
             "blank": disp.get("display_blank"),
             "display": disp.get("display"),
-            "isolated": lock_mod.host_display_isolated(),
+            "isolated": isolated,
             "would_block": lock_mod.blocked_reason() is not None,
+            "route": "agent display" if (locked and auto) else "host",
+            "auto_session": auto,
+            "auto_session_name": config.AUTO_SESSION_NAME if auto else None,
         }
 
     # -- pointer ----------------------------------------------------------

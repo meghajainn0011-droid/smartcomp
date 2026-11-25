@@ -475,6 +475,12 @@ worst case, and it only happens on the first call or a window switch.
 ## Running it
 
 ```bash
+smartcomp               # start the daemon (same as `smartcomp start`)
+smartcomp stop
+smartcomp restart
+smartcomp status        # running? which pid, backend, tool count, lock state
+smartcomp doctor        # every check it can run, with the log tail on failure
+
 cd /home/damon/smartcomp
 .venv/bin/python -m smartcomp.daemon serve      # MCP on 127.0.0.1:8791
 .venv/bin/python -m smartcomp.tray              # panel icon
@@ -590,14 +596,34 @@ unlock tool and no stored password: "working through a lock" by taking the
 lock away is the wrong trade, and typing a login password into whatever has
 the keyboard is worse.
 
-What happens instead:
+What happens instead — the agent keeps working, the host keeps its lock:
 
 | Situation | Behaviour |
 |---|---|
-| Host display locked | Screen-touching tools (`click_element`, `type_text`, `screen_state`, `popups`, `draw_stroke`, …) return `ok:false, locked:true` plus a hint. Nothing is woken, nothing is typed into the lock prompt, and the lock stays up. |
-| Host display blanked (DPMS) | Nothing is forced on. The framebuffer is still readable, so perception works; `health.display.display_blank` reports the monitor state. |
-| Work must continue while locked | `session_create(name)` gives the agent its own X server. Its XTEST input and captures never reach the host's lock screen, so the agent keeps working in the background — the same path other computer-use stacks use. |
-| `lock_state` | Read-only report: `locked`, `blank`, `display`, `isolated`, `would_block`. |
+| Host display locked | Desktop tools are **routed automatically** to the agent's own display (see below) and the reply carries `routed: {session, display, reason}`. No tool returns a bare "locked" error unless the fallback is off or cannot start. Nothing is woken, nothing is typed into the lock prompt, the lock stays up. |
+| Host display blanked (DPMS) | Nothing is forced on and nothing is blocked: DPMS powers the monitor output off, the X framebuffer is unchanged, so capture, OCR, detections and XTEST all work exactly as before. `lock_state.blank` reports the monitor state. |
+| Host suspended (S3) | Everything on the machine is frozen, smartcomp included — no code runs during suspend, by definition. On resume the daemon, its sessions and their X servers continue; a call that was in flight may time out, and the next call succeeds. SmartComp does not wake a suspended machine and does not create a wake alarm. |
+| Work continues while locked | The first desktop call after the lock creates a headless session named `agent` (own Xvfb, own daemon, own token), reuses it for later calls (~4 s, not ~30 s), and leaves the host alone. `session_close("agent")` stops it; the next locked call recreates it. |
+| `lock_state` | Read-only report: `locked`, `blank`, `display`, `isolated`, `would_block`, `route` (`host` or `agent display`), `auto_session`. |
+
+The routed set is "every tool that operates a desktop" — clicks, keys, scroll,
+clips, capture, OCR, popups, drawing, plus `launch_app`, `list_windows`,
+`focus_window`, `move_window`, `close_window`, `window_state`,
+`clipboard_*` and `app_status`, so an agent on its own desktop can also start
+and inspect apps there. Session management, memory, skills and media capture
+stay local to the daemon (`_LOCAL_ONLY` in `tools.py`); a new desktop tool is
+routed without being added to a list.
+
+`SMARTCOMP_AUTO_SESSION=0` turns the fallback off and restores the explicit
+`ok:false, locked:true` refusal. `SMARTCOMP_AUTO_SESSION_WAIT` (seconds,
+default 45) bounds the first-call startup.
+
+This is the honest version of "works through a lock". A locked X server
+delivers XTEST input to the lock's grab and shows the lock screen, so no
+client can drive the human's desktop while it is locked; `XSendEvent` is
+ignored by most toolkits and is a lock bypass besides. Every computer-use
+stack that claims otherwise either unlocks, uses its own desktop, or does not
+actually work. Here the work moves, the lock does not.
 
 The gate is per-daemon: a session daemon carries `SMARTCOMP_SESSION_NAME`, so
 it is exempt (its display has no lock). `SMARTCOMP_HOST_LOCK_GATE=0` is the
@@ -607,8 +633,16 @@ lock state is irrelevant.
 Verified by construction and by test: `smartcomp/display.py` runs only
 `xset q` (read), `smartcomp/lock.py` only reads `ScreenSaver.GetActive`, and
 unit tests assert that the removed API stays removed (`unlock`, `hard_unlock`,
-`ensure_screen`, `wake_display`, `enable`, lid-policy writers) and that a
-locked-host refusal runs **no subprocess at all**.
+`ensure_screen`, `wake_display`, `enable`, lid-policy writers). The host is
+also never *re-blanked*: `doctor` and `status` only read, and no code path
+calls `xset dpms force on/off`, `xdg-screensaver reset` or `systemd-inhibit`.
+
+Live proof on this machine, with the host locked at 16:49 and unlocked only by
+the operator afterwards: `describe_screen` → `routed` on `:1000` and returned a
+real window with controls (30 s first call, 3.8 s after), `launch_app` started
+Mousepad there, `type_text` typed into it, and `read_window` read the phrase
+back; `xfce4-screensaver-command -q` stayed `active`, `xset q` was unchanged,
+and the journal showed no unlock. `smartcomp doctor` reported 11/11 PASS.
 
 ## Layout
 
@@ -625,7 +659,9 @@ locked-host refusal runs **no subprocess at all**.
 | `smartcomp/mpx.py` | multi-pointer X wrapper (own cursor per master); unused, see above |
 | `smartcomp/server.py` | FastMCP streamable HTTP + bearer middleware |
 | `smartcomp/tray.py` | Gtk.StatusIcon tray, host diagnostics |
-| `smartcomp/daemon.py` | CLI: `serve`, `tray`, `once`, `bench`, `state` |
+| `smartcomp/service.py` | start/stop/restart/status/doctor for the daemon |
+| `smartcomp/rpc.py` | internal JSON-RPC client (doctor probe, lock routing) |
+| `smartcomp/daemon.py` | CLI: `start` (default), `stop`, `restart`, `status`, `doctor`, `serve`, `tray`, `once`, `bench`, `state` |
 | `scripts/fetch_*.sh` | resumable model/wheel downloads for slow links |
 
 `models/` holds `gpa_gui_detector.onnx` (80 MB, single-class icon/button

@@ -51,7 +51,11 @@ def free_port() -> int:
 
 
 def start_daemon(port: int) -> subprocess.Popen:
-    env = dict(os.environ, SMARTCOMP_PORT=str(port))
+    # A transport test must not depend on whether the human has the host locked:
+    # the throwaway daemon reads the display directly (capture only -- it never
+    # types anything) and must not create an "agent" session for it.
+    env = dict(os.environ, SMARTCOMP_PORT=str(port),
+               SMARTCOMP_HOST_LOCK_GATE="0", SMARTCOMP_AUTO_SESSION="0")
     proc = subprocess.Popen(
         [str(ROOT / ".venv/bin/smartcomp"), "serve"],
         cwd=str(ROOT), env=env,

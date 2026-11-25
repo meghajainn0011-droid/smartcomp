@@ -327,12 +327,13 @@ DPMS (Energy Star):
 
 
 class TestHostLockGate(unittest.TestCase):
-    """A locked host is refused, never unlocked and never woken.
+    """A locked host is never unlocked and never woken; the work moves instead.
 
     The daemon used to release the lock (ScreenSaver.SetActive) and force DPMS
     on before every action -- that is how an agent unlocked the user's desktop
-    and kept it from locking. The gate is read-only: it reports, and the
-    caller moves the work to a session display.
+    and kept it from locking. The gate is read-only: it reports, and desktop
+    tools are re-run on the agent's own display (tools._LOCAL_ONLY lists what
+    stays on the host).
     """
 
     def setUp(self):
@@ -372,6 +373,29 @@ class TestHostLockGate(unittest.TestCase):
                 unittest.mock.patch("subprocess.run") as run:
             self.assertIsNotNone(lock_mod.blocked_reason())
         run.assert_not_called()
+
+    def test_desktop_tools_are_routed(self):
+        # A tool that operates a desktop must move to the agent's display while
+        # the host is locked, including the ones that used to be "not gated"
+        # because EWMH still works through a lock: an agent on its own desktop
+        # has to be able to start and inspect apps there.
+        for name in ("click_element", "type_text", "screen_state", "get_changes",
+                     "screenshot", "popups", "draw_stroke", "launch_app",
+                     "list_windows", "focus_window", "move_window", "close_window",
+                     "window_state", "clipboard_get", "clipboard_set", "app_status",
+                     "wait_for_change"):
+            self.assertNotIn(name, tools_mod._LOCAL_ONLY, name)
+
+    def test_daemon_and_host_tools_are_local(self):
+        # These belong to the daemon, the host or the process table -- routing
+        # them to a virtual display would answer a different question.
+        for name in ("health", "lock_state", "stats", "session_create",
+                     "session_list", "session_endpoint", "session_close",
+                     "session_align", "session_train", "session_end",
+                     "remember", "recall", "run_skill", "skill_create",
+                     "media_understand", "media_listen", "media_watch",
+                     "app_owners", "app_release"):
+            self.assertIn(name, tools_mod._LOCAL_ONLY, name)
 
 
 class TestNoHostLockMutation(unittest.TestCase):
@@ -1268,6 +1292,12 @@ class TestCloseWindowReport(unittest.TestCase):
             {"id": "0x9", "comm": "mousepad", "x": 200, "y": 150,
              "w": 500, "h": 400}]
         self.wins.close.return_value = {"ok": True}
+        # These are host-desktop tests, so pin the host to "unlocked": the
+        # wrapper consults the real lock, and a test suite must not change its
+        # meaning depending on whether the operator has the screen locked.
+        unlocked = unittest.mock.patch.object(lock_mod, "lock_state", return_value=False)
+        unlocked.start()
+        self.addCleanup(unlocked.stop)
         registry = tools_mod.register(
             mcp, self.perception, unittest.mock.Mock(), self.wins,
             unittest.mock.Mock(), display=unittest.mock.Mock())
@@ -1701,6 +1731,10 @@ class TestToolSurface(unittest.TestCase):
         mcp = unittest.mock.Mock()
         mcp.tool.return_value = lambda fn: fn  # registration is a no-op here
         self.perception = unittest.mock.Mock()
+        # Unlocked host by default; the gate tests below patch it explicitly.
+        unlocked = unittest.mock.patch.object(lock_mod, "lock_state", return_value=False)
+        unlocked.start()
+        self.addCleanup(unlocked.stop)
         self.registry = tools_mod.register(
             mcp, self.perception, unittest.mock.Mock(),
             unittest.mock.Mock(), unittest.mock.Mock(),
@@ -1720,15 +1754,74 @@ class TestToolSurface(unittest.TestCase):
             self.assertNotIn(gone, self.registry, gone)
         self.assertIn("lock_state", self.registry)
 
-    def test_locked_host_refuses_without_touching_the_screen(self):
+    def test_lock_state_reports_where_screen_tools_run(self):
+        with unittest.mock.patch.object(lock_mod, "lock_state", return_value=True), \
+                unittest.mock.patch.object(lock_mod, "host_display_isolated",
+                                           return_value=False):
+            out = self.registry["lock_state"]()
+        self.assertEqual(out["route"], "agent display")
+        self.assertEqual(out["auto_session_name"], "agent")
+        with unittest.mock.patch.object(lock_mod, "lock_state", return_value=True), \
+                unittest.mock.patch.object(lock_mod, "host_display_isolated",
+                                           return_value=True):
+            isolated = self.registry["lock_state"]()
+        self.assertEqual(isolated["route"], "host")
+
+    def test_locked_host_refuses_when_the_fallback_is_off(self):
         blocked = {"error": "host display is locked", "locked": True,
                    "hint": "use session_create"}
         with unittest.mock.patch.object(lock_mod, "blocked_reason",
-                                        return_value=blocked):
+                                        return_value=blocked), \
+                unittest.mock.patch.object(lock_mod, "lock_state", return_value=True), \
+                unittest.mock.patch.object(lock_mod, "host_display_isolated",
+                                           return_value=False), \
+                unittest.mock.patch.object(config, "auto_session_enabled",
+                                           return_value=False):
             out = self.registry["screen_state"]()
         self.assertFalse(out["ok"])
         self.assertTrue(out["locked"])
         self.perception.get_changes.assert_not_called()
+
+    def test_locked_host_offers_the_agent_display(self):
+        blocked = {"error": "host display is locked", "locked": True}
+        manager = unittest.mock.Mock()
+        manager.list.return_value = [{"name": "agent", "display": ":1001",
+                                      "port": 45999, "alive": True, "healthy": True}]
+        manager.auth.return_value = ("http://127.0.0.1:45999/mcp", "tok")
+        fake = type("S", (), {"manager": staticmethod(lambda: manager)})()
+        routed = {"ok": True, "active": {"title": "Agent desktop"}, "elements": []}
+        with unittest.mock.patch.object(lock_mod, "blocked_reason",
+                                        return_value=blocked), \
+                unittest.mock.patch.object(lock_mod, "lock_state", return_value=True), \
+                unittest.mock.patch.object(lock_mod, "host_display_isolated",
+                                           return_value=False), \
+                unittest.mock.patch.object(tools_mod, "_sessions", lambda: fake), \
+                unittest.mock.patch("smartcomp.rpc.call_tool",
+                                    return_value=dict(routed)) as call:
+            out = self.registry["describe_screen"]()
+        self.assertTrue(out["ok"])
+        self.assertEqual(out["routed"]["session"], "agent")
+        self.assertEqual(out["routed"]["display"], ":1001")
+        self.assertIn("host display is locked", out["routed"]["reason"])
+        call.assert_called_once()
+        self.assertEqual(call.call_args.args[2], "describe_screen")
+        self.perception.capturer.grab.assert_not_called()
+
+    def test_fallback_failure_keeps_the_explicit_refusal(self):
+        blocked = {"error": "host display is locked", "locked": True}
+        manager = unittest.mock.Mock()
+        manager.list.return_value = []
+        manager.create.return_value = {"ok": False, "error": "no free display"}
+        fake = type("S", (), {"manager": staticmethod(lambda: manager)})()
+        with unittest.mock.patch.object(lock_mod, "blocked_reason",
+                                        return_value=blocked), \
+                unittest.mock.patch.object(lock_mod, "lock_state", return_value=True), \
+                unittest.mock.patch.object(lock_mod, "host_display_isolated",
+                                           return_value=False), \
+                unittest.mock.patch.object(tools_mod, "_sessions", lambda: fake):
+            out = self.registry["screen_state"]()
+        self.assertFalse(out["ok"])
+        self.assertIn("no free display", out["route_error"])
 
     def test_window_management_is_not_gated(self):
         # EWMH/selections work while locked and cannot type into the lock
@@ -1860,6 +1953,105 @@ class TestSessionPrune(unittest.TestCase):
         current = self.mem.sessions_dir / self.mem.session
         self.mem.prune_sessions(older_than_hours=24)
         self.assertTrue(current.exists())
+
+
+class TestRpcWire(unittest.TestCase):
+    """The internal JSON-RPC client the doctor and the lock fallback share."""
+
+    def test_sse_frames_are_parsed(self):
+        from smartcomp import rpc
+
+        body = ('event: message\n'
+                'data: {"jsonrpc":"2.0","id":1,"result":{"tools":[{"name":"a"}]}}\n\n')
+        messages = rpc.parse_messages(body, "text/event-stream")
+        self.assertEqual(messages[0]["result"]["tools"][0]["name"], "a")
+
+    def test_plain_json_body_is_parsed(self):
+        from smartcomp import rpc
+
+        messages = rpc.parse_messages('{"jsonrpc":"2.0","id":2,"result":{}}', "application/json")
+        self.assertEqual(messages[0]["id"], 2)
+
+    def test_garbage_does_not_raise(self):
+        from smartcomp import rpc
+
+        self.assertEqual(rpc.parse_messages("<html>502</html>", "text/html"), [])
+        self.assertEqual(rpc.parse_messages("data: not-json\n\n", "text/event-stream"), [])
+
+    def test_call_tool_prefers_structured_content(self):
+        from smartcomp import rpc
+
+        with unittest.mock.patch.object(rpc, "call", return_value={
+                "structuredContent": {"ok": True, "elements": [1]},
+                "content": [{"type": "text", "text": '{"ok": true}'}],
+                "isError": False}):
+            out = rpc.call_tool("http://x/mcp", "t", "screen_state", {})
+        self.assertEqual(out["elements"], [1])
+
+    def test_call_tool_falls_back_to_the_text_block(self):
+        from smartcomp import rpc
+
+        with unittest.mock.patch.object(rpc, "call", return_value={
+                "content": [{"type": "text", "text": '{"ok": true, "count": 3}'}],
+                "isError": False}):
+            out = rpc.call_tool("http://x/mcp", "t", "list_windows", {})
+        self.assertEqual(out["count"], 3)
+
+    def test_is_error_marks_the_result(self):
+        from smartcomp import rpc
+
+        with unittest.mock.patch.object(rpc, "call", return_value={
+                "content": [{"type": "text", "text": "boom"}], "isError": True}):
+            out = rpc.call_tool("http://x/mcp", "t", "click_element", {})
+        self.assertFalse(out["ok"])
+
+
+class TestCliCommands(unittest.TestCase):
+    """`smartcomp` starts; stop/restart/status/doctor exist and report clearly."""
+
+    def test_bare_smartcomp_starts_the_daemon(self):
+        from smartcomp import daemon, service
+
+        with unittest.mock.patch.object(service, "start", return_value=0) as start:
+            self.assertEqual(daemon.main([]), 0)
+        start.assert_called_once()
+
+    def test_doctor_exit_code_follows_the_checks(self):
+        from smartcomp import daemon, service
+
+        report = {"ok": False, "checks": [
+            {"name": "service", "ok": False, "detail": "not running"}]}
+        with unittest.mock.patch.object(service, "doctor", return_value=report):
+            self.assertEqual(daemon.main(["doctor"]), 1)
+        report["ok"] = True
+        report["checks"][0]["ok"] = True
+        with unittest.mock.patch.object(service, "doctor", return_value=report):
+            self.assertEqual(daemon.main(["doctor"]), 0)
+
+    def test_status_reports_stopped_without_raising(self):
+        from smartcomp import service
+
+        with unittest.mock.patch.object(service, "running_pid", return_value=None), \
+                unittest.mock.patch.object(service, "_probe",
+                                           return_value=(False, "refused", None)):
+            self.assertEqual(service.status(), 1)
+
+    def test_doctor_warns_instead_of_failing_when_the_lock_is_undetectable(self):
+        from smartcomp import service
+
+        with unittest.mock.patch.object(service, "unit_installed", return_value=True), \
+                unittest.mock.patch.object(service, "running_pid", return_value=123), \
+                unittest.mock.patch.object(service, "_probe", return_value=(True, "ok", 55)), \
+                unittest.mock.patch.object(service.shutil, "which", return_value="/usr/bin/x"), \
+                unittest.mock.patch("smartcomp.lock.is_locked", return_value=None), \
+                unittest.mock.patch("smartcomp.rpc.list_tools", return_value=[{}] * 55), \
+                unittest.mock.patch("smartcomp.sessions.manager") as mgr, \
+                unittest.mock.patch.object(service, "_orphans", return_value=[]):
+            mgr.return_value.list.return_value = []
+            report = service.doctor()
+        lock_check = next(c for c in report["checks"] if c["name"] == "lock state readable")
+        self.assertIsNone(lock_check["ok"])  # WARN, not FAIL
+        self.assertTrue(any(c["name"] == "mcp tools/list" and c["ok"] for c in report["checks"]))
 
 
 if __name__ == "__main__":

@@ -378,6 +378,19 @@ class SessionManager:
                     "docs": str(config.PROJECT_ROOT / "README.md")},
         }
 
+    def auth(self, name: str) -> tuple[str, str]:
+        """(MCP url, bearer token) for a registered session; internal callers.
+
+        The same pair `endpoint()` hands a second agent, without a second parse
+        of the headers by the lock fallback.
+        """
+        reg = self._load()
+        s = reg["sessions"].get(name)
+        if not s:
+            raise KeyError(name)
+        token = (Path(s["dir"]) / "token").read_text().strip()
+        return f"http://127.0.0.1:{s['port']}/mcp", token
+
     # -- aligned memory + training loop ----------------------------------
     def _session_memory(self, s: dict) -> Memory:
         return Memory(path=Path(s["dir"]) / "memory.db")
