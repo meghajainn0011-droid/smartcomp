@@ -442,6 +442,7 @@ _LOCAL_ONLY = frozenset({
     "forget_skill", "list_skills", "skill_learn_recent", "skills_install",
     "media_understand", "media_listen", "media_watch", "media_audio_check",
     "media_capabilities", "app_owners", "app_release",
+    "task_queue", "task_cancel", "task_model",
 })
 
 
@@ -501,8 +502,28 @@ def register(mcp, perception: Perception, inp: Input, wins: Windows, memory: Mem
             bound = inspect.signature(fn).bind(*args, **kwargs)
             bound.apply_defaults()
             url, token = mgr.auth(name)
-            out = rpc.call_tool(url, token, fn.__name__, dict(bound.arguments),
+            call_args = dict(bound.arguments)
+            out = rpc.call_tool(url, token, fn.__name__, call_args,
                                 timeout=180.0)
+            err_msg = str(out.get("error") or "")
+            if out.get("ok") is False and ("ConnectionClosedError" in err_msg or "Broken pipe" in err_msg):
+                log.warning("agent display %s lost X connection (%s); recreating once", name, err_msg)
+                mgr.close(name)
+                created = mgr.create(name, visible=False)
+                if not created.get("ok"):
+                    return None, str(created.get("error") or "could not recreate the agent display")
+                deadline = time.time() + config.AUTO_SESSION_WAIT
+                record = None
+                while time.time() < deadline:
+                    record = next((s for s in mgr.list() if s["name"] == name), None)
+                    if record and record.get("healthy"):
+                        break
+                    time.sleep(0.5)
+                if not (record and record.get("healthy")):
+                    return None, (f"agent display {name!r} did not become healthy in "
+                                  f"{config.AUTO_SESSION_WAIT:.0f}s")
+                url, token = mgr.auth(name)
+                out = rpc.call_tool(url, token, fn.__name__, call_args, timeout=180.0)
             out["routed"] = {
                 "session": name,
                 "display": record.get("display"),
@@ -600,7 +621,8 @@ def register(mcp, perception: Perception, inp: Input, wins: Windows, memory: Mem
 
     # -- perception -------------------------------------------------------
     @tool
-    def get_changes(force_full: bool = False, verbose_del: bool = False) -> dict:
+    def get_changes(force_full: bool = False, verbose_del: bool = False,
+                    detect: bool = True) -> dict:
         """Return screen elements added or removed since the previous call.
 
         Coordinates are permille of a 960x540 logical frame. `add` entries have
@@ -614,13 +636,16 @@ def register(mcp, perception: Perception, inp: Input, wins: Windows, memory: Mem
 
         Note: input actions (click_element, type_text, key, scroll) already
         attach their screen answer as a `changed` block -- this call is for
-        re-checking later, not for learning what an action did.
+        re-checking later, not for learning what an action did. detect=false
+        skips the icon model: text and layout still update, and a wait is
+        ~4x cheaper because the detector is the expensive part of a pass.
         """
         marker = config.state_dir() / "force_full"
         if marker.exists():
             marker.unlink(missing_ok=True)
             force_full = True
-        return perception.get_changes(force_full=force_full, verbose_del=verbose_del)
+        return perception.get_changes(force_full=force_full, verbose_del=verbose_del,
+                                      detect=detect)
 
     @tool
     def find(text: str, limit: int = 10) -> dict:
@@ -694,7 +719,10 @@ def register(mcp, perception: Perception, inp: Input, wins: Windows, memory: Mem
         deadline = start + max(0.1, timeout_s)
         poll = 0
         while True:
-            payload = perception.get_changes()
+            # Icons are not needed to know that something moved, and the
+            # detector is the expensive part of a pass (~0.5 s int8): a wait
+            # polls tiles + OCR only.
+            payload = perception.get_changes(detect=False)
             if payload.get("add") or payload.get("del") or payload.get("full"):
                 payload["waited_ms"] = round((time.perf_counter() - start) * 1000, 1)
                 return payload
@@ -878,7 +906,8 @@ def register(mcp, perception: Perception, inp: Input, wins: Windows, memory: Mem
         return {
             "ok": True,
             "ocr": perception.ocr.engine,
-            "detector": "ready" if perception.detector.ready else perception.detector.error,
+            "detector": ("ready" if perception.detector.ready else "idle"
+                         if perception.detector.available else perception.detector.error),
             "screen": list(perception.capturer.native_size),
             "session": memory.session,
             "display": display.status(),
@@ -1092,8 +1121,14 @@ def register(mcp, perception: Perception, inp: Input, wins: Windows, memory: Mem
         b, err = _resolve_element(perception, end_id, None)
         if err:
             return err
-        pixels = [_px(perception, *_center(a["b"])), _px(perception, *_center(b["b"]))]
-        inp.drag(pixels, duration=duration)
+        p0, p1 = _px(perception, *_center(a["b"])), _px(perception, *_center(b["b"]))
+        steps = 20
+        pixels = [
+            (round(p0[0] + (p1[0] - p0[0]) * i / steps),
+             round(p0[1] + (p1[1] - p0[1]) * i / steps))
+            for i in range(steps + 1)
+        ]
+        inp.drag(pixels, duration=duration or 0.4)
         result = {"ok": True, "dragged": {"from": _describe(a), "to": _describe(b)}}
         end = _center(b["b"])
         return _report_delta(perception, result, at=list(end)) if report else result
@@ -1256,7 +1291,8 @@ def register(mcp, perception: Perception, inp: Input, wins: Windows, memory: Mem
     # -- apps -------------------------------------------------------------
     @tool
     def launch_app(name: str, args: list[str] | None = None,
-                   force: bool = False, profile: str = "") -> dict:
+                   force: bool = False, profile: str = "",
+                   report: bool = True) -> dict:
         """Open an allowlisted app, or focus the one that is already open.
 
         brave, chromium, firefox, terminal, text-editor, file-manager,
@@ -1315,13 +1351,13 @@ def register(mcp, perception: Perception, inp: Input, wins: Windows, memory: Mem
                          "another instance",
             }
         launch_args = list(args or [])
-        if taken or force:
-            launch_args += apps_mod.profile_args(binary, name.lower())
         if profile == "real":
             base = Path(os.environ.get("SMARTCOMP_STATE_DIR")
                         or Path(os.environ.get("XDG_RUNTIME_DIR", "/tmp")) / "smartcomp-profiles"
                         / name.lower())
             launch_args += apps_mod.clone_profile(binary, base / "profiles")
+        elif taken or force:
+            launch_args += apps_mod.profile_args(binary, name.lower())
         pid = launch(binary, launch_args)
         own.claim(name.lower(), None, pid if pid else None)
         memory.remember(f"app:{name.lower()}", {"binary": binary, "pid": pid})
@@ -1346,7 +1382,7 @@ def register(mcp, perception: Perception, inp: Input, wins: Windows, memory: Mem
                 result["window"] = win["id"]
                 result["title"] = win.get("title", "")
                 break
-        return _report_delta(perception, result)
+        return _report_delta(perception, result) if report else result
 
     # -- isolated agent sessions -------------------------------------------
     @tool
@@ -1526,6 +1562,82 @@ def register(mcp, perception: Perception, inp: Input, wins: Windows, memory: Mem
                         "results": results}
         memory.record_skill_use(name, True)
         return {"ok": True, "skill": name, "steps": len(results)}
+
+    @tool
+    def task(goal: str, app: str | None = None, url: str | None = None,
+             click: str | None = None, expect: str | None = None,
+             steps: list[dict] | None = None, timeout: float = 90.0,
+             learn: bool = True, reuse: bool = True) -> dict:
+        """Do a whole desktop flow in ONE call and report the result.
+
+        This is the tool that replaces a chain of calls. Example:
+
+            task(goal="open the profile page", app="firefox",
+                 url="https://instagram.com/someone", click="Profile")
+
+        runs: reuse-or-launch Firefox, focus it, go to the URL, wait for
+        "Profile" to appear, click it, wait for the page to settle, read the
+        window, and return one report -- `answer` (title + visible lines) and
+        `steps` (what ran, ok/ms). On failure it says which step failed and
+        what was visible instead, in the same shape.
+
+        Planning: explicit `app`/`url`/`click`/`expect` win; otherwise the
+        goal's verbs are parsed ("open firefox", "visit x.com", "click Sign
+        in"). `steps=[{tool,args},...]` takes a literal plan. A task that
+        worked is saved under the goal, so repeating it replays the plan
+        (`learned: true`) instead of planning again.
+
+        Tasks queue: a second agent's task waits for the first and then runs
+        (arrival order, one pointer). `timeout` is the wait for the result;
+        if it elapses the task keeps running and the reply carries `task_id`
+        for task_status/task_cancel.
+        """
+        from . import tasks as tasks_mod
+
+        run = tasks_mod.configure(registry, memory)
+        name = None
+        if steps:
+            plan = tasks_mod._plan_ok(steps)
+            if not plan:
+                return {"ok": False, "error": "steps must be [{tool, args}]"}
+            template = "custom"
+        else:
+            plan = []
+            learned = tasks_mod.learned_plan(memory, goal) if reuse else None
+            if learned:
+                name, plan = learned
+                template = "learned"
+            else:
+                parsed = tasks_mod.parse_goal(goal, app=app, url=url, click=click,
+                                              expect=expect)
+                plan, template = parsed["plan"], parsed["template"]
+        result = run.submit(goal, plan, template, wait_s=timeout)
+        if name:
+            memory.record_skill_use(name, bool(result.get("ok")))
+            result["learned"] = True
+            result["skill"] = name
+        return result
+
+    @tool
+    def task_queue() -> dict:
+        """Queue depth, the running/last tasks and the learned router's stats."""
+        from . import tasks as tasks_mod
+
+        return tasks_mod.configure(registry, memory).snapshot()
+
+    @tool
+    def task_cancel(task_id: str) -> dict:
+        """Cancel a queued or running task between steps."""
+        from . import tasks as tasks_mod
+
+        return tasks_mod.configure(registry, memory).cancel(task_id)
+
+    @tool
+    def task_model() -> dict:
+        """What the tiny goal router has learned (examples, accuracy, bytes)."""
+        from . import tasks as tasks_mod
+
+        return {"ok": True, **tasks_mod.configure(registry, memory).snapshot()["model"]}
 
     @tool
     def list_skills() -> dict:

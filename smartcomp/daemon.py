@@ -71,7 +71,7 @@ def _bench(args) -> int:
     print(f"  payload   median={statistics.median(payload_sizes):.0f} bytes")
     print(f"idle screen: total={idle['total']:.1f}ms tiles={idle['tiles']} (cost of a no-op poll)")
     print(f"elements   {len(p.elements)}")
-    if p.detector.error:
+    if not p.detector.available:
         print(f"detector   UNAVAILABLE: {p.detector.error}")
     sample = [e["x"] for e in p.get_changes(force_full=True).get("add", []) if e["k"] == "t"]
     print("sample text:", sample[:10])

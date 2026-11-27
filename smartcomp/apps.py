@@ -46,9 +46,13 @@ def profile_args(binary: str, name: str) -> list[str]:
     base = Path(os.environ.get("XDG_RUNTIME_DIR", "/tmp")) / "smartcomp-profiles" / ident
     base.mkdir(parents=True, exist_ok=True)
     if binary in ("firefox", "firefox-esr"):
-        return ["-profile", str(base / "firefox")]
+        pdir = base / "firefox"
+        pdir.mkdir(parents=True, exist_ok=True)
+        return ["-profile", str(pdir)]
     if binary in ("brave-browser", "chromium", "google-chrome"):
-        return [f"--user-data-dir={base / binary}"]
+        pdir = base / binary
+        pdir.mkdir(parents=True, exist_ok=True)
+        return [f"--user-data-dir={pdir}"]
     return []
 
 
@@ -59,6 +63,8 @@ _PROFILE_SKIP = (
     "cache2*", "thumbnails", "crashes", "minidumps", "datareporting", "saved-telemetry-pings",
     "security_state", "storage", "lock", ".parentlock", "lockfile",
     "SingletonLock", "SingletonCookie", "SingletonSocket",
+    "sessionstore*", "sessionstore-backups", "recovery*", "sessionCheckpoints.json",
+    "previous.jsonlz4*", "upgrade.jsonlz4*",
 )
 
 

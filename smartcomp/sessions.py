@@ -30,6 +30,7 @@ from .memory import Memory
 log = logging.getLogger("smartcomp.sessions")
 
 _DISPLAY_BASE = 1000          # avoid host :0-:2 and the CI convention :99
+_X11_DIR = Path("/tmp/.X11-unix")  # patched by tests so they ignore the host
 _GEOMETRY = "1920x1080x24"
 
 
@@ -60,8 +61,25 @@ def _reap(pid: int, timeout: float = 5.0) -> None:
         pass
 
 
-_PORT_BASE_OFFSET = 1         # main daemon is config.MCP_PORT; sessions follow
-_HEALTH_TIMEOUT = 40.0        # detector load on this 2-core box is ~20 s
+def _pid_alive(pid: int) -> bool:
+    """True only for a live, non-zombie process this daemon may inspect."""
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        return False
+    try:
+        os.waitpid(pid, os.WNOHANG)  # reap our own zombies
+    except OSError:
+        pass
+    try:
+        stat = Path(f"/proc/{pid}/stat").read_text()
+    except OSError:
+        return False
+    rparen = stat.rfind(")")
+    return not (rparen != -1 and stat[rparen + 2 : rparen + 3] in ("Z", "X"))
+
+
+_PORT_BASE_OFFSET = 1         # main daemon is config.MCP_PORT; sessions follow_HEALTH_TIMEOUT = 40.0        # detector load on this 2-core box is ~20 s
 
 _mgr: "SessionManager | None" = None
 
@@ -104,11 +122,33 @@ class SessionManager:
 
     # -- allocation ------------------------------------------------------
     def _free_display(self, reg: dict) -> str:
+        """Lowest display not in the registry and not owned by a live server.
+
+        A killed Xvfb leaves its socket and lock behind; treating every socket
+        as taken therefore leaks display numbers until a restart. The lock
+        file names the owner pid, so a socket is only "in use" while that pid
+        lives. A socket with no lock at all is still honoured -- some servers
+        do not write one, and guessing there would start a second server on a
+        live display.
+        """
         used = set()
         for s in reg["sessions"].values():
             used.add(s["display"])
-        for path in Path("/tmp/.X11-unix").glob("X*"):
-            used.add(":" + path.name[1:])
+        for path in _X11_DIR.glob("X*"):
+            name = path.name[1:]
+            if not name.isdigit():
+                continue
+            lock = Path(f"/tmp/.X{name}-lock")
+            if not lock.exists():
+                used.add(f":{name}")
+                continue
+            try:
+                pid = int(lock.read_text().strip())
+            except (OSError, ValueError):
+                used.add(f":{name}")
+                continue
+            if _pid_alive(pid):
+                used.add(f":{name}")
         n = _DISPLAY_BASE
         while f":{n}" in used:
             n += 1
@@ -124,11 +164,7 @@ class SessionManager:
 
     @staticmethod
     def _alive(pid: int) -> bool:
-        try:
-            os.kill(pid, 0)
-            return True
-        except (OSError, ProcessLookupError):
-            return False
+        return _pid_alive(pid)
 
     def _healthy(self, port: int, token: str) -> bool:
         import urllib.error
@@ -326,6 +362,13 @@ class SessionManager:
                 os.environ["SMARTCOMP_SESSION_NAME"] = saved
             else:
                 os.environ.pop("SMARTCOMP_SESSION_NAME", None)
+        proxy_pidf = Path(s["dir"]) / "dbus-proxy.pid"
+        if proxy_pidf.exists():
+            try:
+                os.kill(int(proxy_pidf.read_text().strip()), 15)
+            except (OSError, ValueError):
+                pass
+            proxy_pidf.unlink(missing_ok=True)
         for key in ("pid", "wm_pid", "xvfb_pid"):
             pid = s.get(key)
             if not pid:

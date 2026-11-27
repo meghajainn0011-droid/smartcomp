@@ -29,12 +29,34 @@ FULL_FRAME_FRACTION = 0.5  # enough of the screen changed => treat as a new scre
 MIN_REGION_PX = 4000
 
 DETECTOR_MODEL = MODEL_DIR / "gpa_gui_detector.onnx"
+# The int8 build of the same weights (21 MB vs 80 MB, 527 ms vs 1.2 s per
+# 1080p frame on this 2-core box). Same boxes within 90% at IoU 0.5; the fp32
+# file stays as the fallback and for re-exporting.
+DETECTOR_MODEL_INT8 = MODEL_DIR / "gpa_gui_detector_int8.onnx"
 DETECTOR_INPUT = 640
 DETECTOR_CONF = 0.25
 DETECTOR_IOU = 0.45
-# 3 threads measured fastest for this fixed 640x640 export; 4 threads is slower
-# than 3 on a 2-core CPU because the runtime oversubscribes.
-DETECTOR_THREADS = int(os.environ.get("SMARTCOMP_DET_THREADS", "3"))
+# Two threads is the measured optimum for the int8 model on 2 cores (3 and 4
+# oversubscribe and are slower); fp32 wants 2 as well.
+DETECTOR_THREADS = int(os.environ.get("SMARTCOMP_DET_THREADS", "2"))
+# A loaded session costs ~90 MB plus a transient allocation on its first run.
+# Drop it after this long without a detection: text-only work (waits, typing,
+# OCR) then never pays for the icon model, and an idle daemon stays small.
+DETECTOR_IDLE_S = float(os.environ.get("SMARTCOMP_DETECTOR_IDLE", "180"))
+
+
+def detector_enabled() -> bool:
+    """SMARTCOMP_DETECTOR=0 runs OCR-only: ~120 MB, no icon/button boxes."""
+    return os.environ.get("SMARTCOMP_DETECTOR", "1") not in ("0", "false", "no")
+
+
+def detector_model() -> Path:
+    override = os.environ.get("SMARTCOMP_DETECTOR_MODEL")
+    if override:
+        return Path(override)
+    if DETECTOR_MODEL_INT8.exists():
+        return DETECTOR_MODEL_INT8
+    return DETECTOR_MODEL
 
 OCR_MIN_CONFIDENCE = 55.0
 

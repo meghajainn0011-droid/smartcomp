@@ -587,6 +587,86 @@ The venv is created with `--system-site-packages` because numpy, onnxruntime,
 mss, OpenCV, httpx and `mcp` are already installed for the system python; only
 `pystray` is added.
 
+## One call for a whole flow (`task`)
+
+An agent that says "open Firefox, go to X, click the Y button, tell me what it
+says" used to spend 6-10 MCP calls on it — six model turns, six perception
+passes, one wrong coordinate away from starting over. `task` runs the whole
+flow inside the daemon and returns **one** report:
+
+```json
+task(goal="open firefox, go to wikipedia.org and click Log in")
+{"ok": true, "template": "goto", "ms": 6894,
+ "steps": [{"step": "launch_app", "ok": true, "ms": 222},
+           {"step": "goto", "ok": true, "ms": 534},
+           {"step": "wait_text", "ok": true, "ms": 752},
+           {"step": "click_label", "ok": true, "ms": 903},
+           {"step": "settle", "ok": true, "ms": 832},
+           {"step": "report", "ok": true, "ms": 3646}],
+ "answer": {"window": "Wikipedia — Mozilla Firefox",
+            "text": ["Wikipedia", "…", "www.wikipedia.org"]}}
+```
+
+Measured on this machine (1920x1080, host unlocked, Firefox already warm):
+
+| Flow | Calls | Wall time |
+|---|---|---|
+| `launch_app` → Ctrl+L → type URL → Return → `find` → `wait_for_change` → `describe_screen` | 7 | 16.3 s |
+| `task("open firefox, go to wikipedia.org and click Log in")` | **1** | **7.0 s** |
+| same goal again (`learned: true`) | 1 | 16.4 s (Wikipedia was genuinely slow to load) |
+| `task("open firefox and go to …")` with Firefox already open | 1 | 5.2 s, `firefox_procs` 11 → 11 |
+
+`steps` is the whole story on failure too: `failed_at`, the step's error, and
+the text that was visibly on screen instead. A label that never appears fails
+in ~20 s with `"Log in" did not appear` rather than clicking the nearest thing.
+
+Planning is not an LLM. Explicit `app` / `url` / `click` / `expect` win; the
+goal's verbs are parsed otherwise (`open firefox`, `visit x.com`, `click Sign
+in`); `steps=[{tool, args}, …]` takes a literal plan. A missing piece comes
+back as a question, not a guess. The plan's virtual steps are `goto`,
+`wait_text`, `click_label`, `settle` and `report`; everything
+else is a normal tool call by name.
+
+Two agents do not fight over the pointer. Tasks go into one FIFO queue served
+by a single worker, and a caller waits for its own result:
+
+| Two clients, 1 s apart | Result |
+|---|---|
+| A: `open firefox and go to iana.org` | done in 5.5 s |
+| B: `open firefox and go to example.net` | done in 9.7 s (queued behind A, same desktop) |
+
+`task_queue` shows depth, the last ten tasks and the router's stats;
+`task_cancel(task_id)` stops a task between steps; a `task` that exceeds its
+`timeout` keeps running and returns its `task_id` instead of dying.
+
+The running-app check is what makes "open Firefox" idempotent: `launch_app`
+finds the existing window, focuses it, and reports `resumed: true` instead of
+starting a second instance (verified: process count unchanged across the
+whole flow). A cold browser that maps its window late is polled for up to
+15 s before a task gives up, which was the one real cold-start bug.
+
+### It learns
+
+A task that worked is saved as a plan under its goal, so the same request runs
+again as `template: "learned"` with no planning (`task_model` reports the
+examples and templates). New phrasings go to `smartcomp/policy.py`: a softmax
+bag-of-words router over the goal words with SGD on every task outcome. It is
+a few KB of JSON in the state directory, not a transformer — the model budget
+here is "learns the request shapes this agent actually uses", and 13 examples
+already route at 0.85 accuracy. It cannot invent a click target; that is the
+planner's job and it asks when unsure.
+
+### Memory
+
+Idle daemon 118 MB. A `task` flow peaks at **150 MB** (`VmHWM`), well inside
+the 250 MB budget: the detector is loaded lazily and never touched by the
+text-clicking path. `describe_screen` and other icon-detection paths do load
+the int8 GPA model (21 MB of weights, ~155 MB of session), which is why those
+peaks read ~370 MB; the session is released after `SMARTCOMP_DETECTOR_IDLE`
+(180 s) and RSS returns to ~170 MB. `malloc_trim` runs on release so the pages
+go back to the OS. The arena is off (`enable_cpu_mem_arena = False`); with it
+on, the same session held 444 MB for its lifetime.
+
 ## Locked, blanked or asleep (the host is never touched)
 
 SmartComp does **not** unlock the screen, wake a blanked monitor, hold a
@@ -650,7 +730,9 @@ and the journal showed no unlock. `smartcomp doctor` reported 11/11 PASS.
 |---|---|
 | `smartcomp/capture.py` | mss capture, downscale, 144-tile diff |
 | `smartcomp/ocr.py` | tesseract / RapidOCR engines, word→line clustering |
-| `smartcomp/detector.py` | GPA ONNX decode (letterbox, NMS, transpose-safe) |
+| `smartcomp/detector.py` | GPA ONNX decode (letterbox, NMS, transpose-safe); lazy, idle-released |
+| `smartcomp/tasks.py` | one-call `task`: planner, FIFO queue, virtual steps, learned plans |
+| `smartcomp/policy.py` | tiny softmax word router for goal → plan shape |
 | `smartcomp/perception.py` | region clustering, element ids, delta JSON |
 | `smartcomp/apps.py` | app census, launch resume semantics, Firefox tab counts |
 | `smartcomp/display.py` | read-only display status (`xset q`); no inhibit, no wake |
@@ -664,8 +746,10 @@ and the journal showed no unlock. `smartcomp doctor` reported 11/11 PASS.
 | `smartcomp/daemon.py` | CLI: `start` (default), `stop`, `restart`, `status`, `doctor`, `serve`, `tray`, `once`, `bench`, `state` |
 | `scripts/fetch_*.sh` | resumable model/wheel downloads for slow links |
 
-`models/` holds `gpa_gui_detector.onnx` (80 MB, single-class icon/button
- detector) and `mobilenetv3_small.onnx` (15-class UI element classifier:
+`models/` holds `gpa_gui_detector_int8.onnx` (20 MB, the one actually
+ loaded: same detections as the fp32 weights at a quarter of the RAM) and
+ `gpa_gui_detector.onnx` (80 MB, single-class icon/button detector, the
+ fallback) and `mobilenetv3_small.onnx` (15-class UI element classifier:
  button / link / text input / ..., downloaded but not wired in yet — it is the
  natural next step for naming `k:"i"` elements).
 

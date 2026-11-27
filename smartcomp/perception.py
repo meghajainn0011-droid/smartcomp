@@ -55,7 +55,7 @@ class Perception:
         self.capturer = Capturer(display=display)
         self.ocr = Ocr()
         self.detector = Detector(
-            config.DETECTOR_MODEL,
+            config.detector_model(),
             input_size=config.DETECTOR_INPUT,
             conf=config.DETECTOR_CONF,
             iou=config.DETECTOR_IOU,
@@ -71,7 +71,8 @@ class Perception:
 
     # -- public -----------------------------------------------------------
 
-    def get_changes(self, force_full: bool = False, verbose_del: bool = False) -> dict:
+    def get_changes(self, force_full: bool = False, verbose_del: bool = False,
+                    detect: bool = True) -> dict:
         t_start = time.perf_counter()
         self.seq += 1
         if force_full:
@@ -112,7 +113,7 @@ class Perception:
         # a 3-thread ONNX run compete with tesseract measured slower (6.1 s vs
         # 5.4 s for the whole call) on this box.
         parallel = len(kept) > 1
-        det_ready = self.detector.ready and (diff.full or bool(kept))
+        det_ready = detect and self.detector.available and (diff.full or bool(kept))
         det_future = (
             self._workers().submit(self.detector.detect, frame.bgr)
             if det_ready and parallel
@@ -253,7 +254,8 @@ class Perception:
             "screen": [config.LOGICAL_W, config.LOGICAL_H],
             "stats": self.last_stats,
             "ocr_engine": self.ocr.engine,
-            "detector": "ready" if self.detector.ready else f"unavailable ({self.detector.error})",
+            "detector": ("ready" if self.detector.ready else "idle (loads on first use)"
+                         if self.detector.available else f"unavailable ({self.detector.error})"),
         }
 
     # -- internals --------------------------------------------------------

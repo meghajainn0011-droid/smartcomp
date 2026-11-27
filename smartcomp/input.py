@@ -293,11 +293,59 @@ def launch(binary: str, args: list[str] | None = None, display: str | None = Non
     into its own transient service (smartcomp-app-*), a cgroup the daemon
     does not own; without one it falls back to the old detached child.
     """
+    import os
+    import shutil
+    from pathlib import Path
+
     cmd = [binary, *(args or [])]
+    # Single-instance D-Bus apps (e.g. thunar) otherwise open on the host :0 display.
+    if (
+        os.environ.get("SMARTCOMP_SESSION_NAME")
+        and os.path.basename(binary)
+        not in ("brave", "brave-browser", "chromium", "google-chrome", "firefox", "firefox-esr")
+        and shutil.which("dbus-run-session")
+    ):
+        cmd = ["dbus-run-session", "--", *cmd]
     pid = _launch_via_user_manager(cmd, display)
     if pid is not None:
         return pid
     return _launch_detached(cmd, display)
+
+
+def _isolated_dbus_addr(host_bus: str) -> str | None:
+    """Proxy D-Bus for isolated sessions: keep secrets/cookies, block host :0 portal."""
+    import os
+    import shutil
+    from pathlib import Path
+
+    if not host_bus or not shutil.which("xdg-dbus-proxy"):
+        return None
+    sdir = Path(os.environ.get("SMARTCOMP_STATE_DIR") or "/tmp")
+    sock = sdir / "dbus-proxy.sock"
+    pidf = sdir / "dbus-proxy.pid"
+    if sock.exists() and pidf.exists():
+        try:
+            os.kill(int(pidf.read_text().strip()), 0)
+            return f"unix:path={sock}"
+        except (OSError, ValueError):
+            pass
+    sock.unlink(missing_ok=True)
+    proc = subprocess.Popen(
+        [
+            "xdg-dbus-proxy", host_bus, str(sock), "--filter",
+            "--talk=org.freedesktop.secrets", "--talk=org.gnome.keyring",
+        ],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        stdin=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+    pidf.write_text(str(proc.pid))
+    for _ in range(20):
+        if sock.exists():
+            return f"unix:path={sock}"
+        time.sleep(0.05)
+    return None
 
 
 def _launch_env(display: str | None) -> dict[str, str]:
@@ -316,6 +364,13 @@ def _launch_env(display: str | None) -> dict[str, str]:
     for key in ("XAUTHORITY", "WAYLAND_DISPLAY", "DBUS_SESSION_BUS_ADDRESS"):
         if os.environ.get(key):
             env[key] = os.environ[key]
+    if os.environ.get("SMARTCOMP_SESSION_NAME"):
+        # Force GTK3 in-process dialogs inside the session X display rather than host :0 portal.
+        env["GTK_USE_PORTAL"] = "0"
+        env["XDG_CURRENT_DESKTOP"] = "GTK"
+        proxy = _isolated_dbus_addr(env.get("DBUS_SESSION_BUS_ADDRESS", ""))
+        if proxy:
+            env["DBUS_SESSION_BUS_ADDRESS"] = proxy
     return env
 
 
@@ -374,8 +429,13 @@ def _launch_detached(cmd: list[str], display: str | None) -> int:
     import os
 
     env = None
-    if display:
-        env = dict(os.environ, DISPLAY=display)
+    if display or os.environ.get("SMARTCOMP_SESSION_NAME"):
+        env = dict(os.environ)
+        if display:
+            env["DISPLAY"] = display
+        if os.environ.get("SMARTCOMP_SESSION_NAME"):
+            env["GTK_USE_PORTAL"] = "0"
+            env["XDG_CURRENT_DESKTOP"] = "GTK"
     try:
         proc = subprocess.Popen(
             cmd,

@@ -11,6 +11,7 @@ import subprocess
 import os
 import sys
 import tempfile
+import threading
 import time
 import unittest
 import unittest.mock
@@ -28,6 +29,8 @@ from smartcomp import popups as popups_mod  # noqa: E402
 from smartcomp import sessions as sessions_mod  # noqa: E402
 from smartcomp import vision as vision_mod  # noqa: E402
 from smartcomp import skillbook as skillbook_mod  # noqa: E402
+from smartcomp import tasks as tasks_mod  # noqa: E402
+from smartcomp import policy as policy_mod  # noqa: E402
 from Xlib import XK  # noqa: E402  (keysym ground truth for alias tests)
 from smartcomp import display as display_mod  # noqa: E402
 from smartcomp import input as input_mod  # noqa: E402
@@ -1436,17 +1439,25 @@ class TestSessionManager(unittest.TestCase):
                 "wm_pid": None, "dir": str(d), "created": 1.0}
 
     def test_free_display_skips_used_and_host(self):
-        reg = {"sessions": {"a": self._rec("a", ":1000", 8792)}}
-        Path("/tmp/.X11-unix").mkdir(exist_ok=True)
-        used_path = Path("/tmp/.X11-unix/X1001")
-        created = not used_path.exists()
-        if created:
-            used_path.touch()
-        try:
-            self.assertEqual(self.mgr._free_display(reg), ":1002")
-        finally:
-            if created:
-                used_path.unlink()
+        """Registry entries and live servers are skipped; stale locks are not.
+
+        A killed Xvfb leaves its lock and socket behind. Counting those as
+        taken leaked display numbers on every crash, so a dead owner pid means
+        the display is free again. The socket directory is patched to a temp
+        dir: the host's own displays must not decide the test's answer.
+        """
+        with tempfile.TemporaryDirectory() as xdir:
+            with unittest.mock.patch.object(sessions_mod, "_X11_DIR", Path(xdir)):
+                reg = {"sessions": {"a": self._rec("a", ":1000", 8792)}}
+                Path(xdir, "X1001").touch()          # live server, lock is us
+                Path("/tmp/.X1001-lock").write_text(str(os.getpid()))
+                Path(xdir, "X1002").touch()          # stale: owner long gone
+                Path("/tmp/.X1002-lock").write_text("999999")
+                try:
+                    self.assertEqual(self.mgr._free_display(reg), ":1002")
+                finally:
+                    Path("/tmp/.X1001-lock").unlink(missing_ok=True)
+                    Path("/tmp/.X1002-lock").unlink(missing_ok=True)
 
     def test_session_creates_token_immediately(self):
         d = self.mgr.root / "tokentest"
@@ -2052,6 +2063,156 @@ class TestCliCommands(unittest.TestCase):
         lock_check = next(c for c in report["checks"] if c["name"] == "lock state readable")
         self.assertIsNone(lock_check["ok"])  # WARN, not FAIL
         self.assertTrue(any(c["name"] == "mcp tools/list" and c["ok"] for c in report["checks"]))
+
+
+class TestProfileCloning(unittest.TestCase):
+    """profile_args must create its directory so -profile never says Profile Missing."""
+
+    def test_profile_args_creates_target_directory(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with unittest.mock.patch.dict(os.environ, {"XDG_RUNTIME_DIR": tmp}):
+                ff_args = apps_mod.profile_args("firefox", "firefox")
+                cr_args = apps_mod.profile_args("chromium", "chromium")
+                self.assertEqual(ff_args[0], "-profile")
+                self.assertTrue(Path(ff_args[1]).is_dir())
+                self.assertTrue(cr_args[0].startswith("--user-data-dir="))
+                self.assertTrue(Path(cr_args[0].split("=", 1)[1]).is_dir())
+
+
+class TestTaskPlanner(unittest.TestCase):
+    """A goal becomes one literal plan; the router only picks a template."""
+
+    def test_url_goal_plans_launch_goto_click(self):
+        plan = tasks_mod.parse_goal("open firefox, go to example.com and click Sign in")
+        self.assertEqual(plan["template"], "goto")
+        tools = [s["tool"] for s in plan["plan"]]
+        self.assertEqual(tools[:2], ["launch_app", "goto"])
+        self.assertIn("click_label", tools)
+        goto = next(s for s in plan["plan"] if s["tool"] == "goto")
+        self.assertEqual(goto["args"]["url"], "example.com")
+        click = next(s for s in plan["plan"] if s["tool"] == "click_label")
+        self.assertEqual(click["args"]["label"], "Sign in")
+
+    def test_app_only_goal_opens_and_reports(self):
+        plan = tasks_mod.parse_goal("open firefox")
+        self.assertEqual(plan["template"], "open")
+        self.assertEqual([s["tool"] for s in plan["plan"]], ["launch_app", "report"])
+
+    def test_explicit_arguments_win_over_parsing(self):
+        plan = tasks_mod.parse_goal("do the thing", app="firefox", url="https://x.dev/a")
+        goto = next(s for s in plan["plan"] if s["tool"] == "goto")
+        self.assertEqual(goto["args"]["url"], "https://x.dev/a")
+        self.assertEqual(plan["plan"][0]["args"]["name"], "firefox")
+
+    def test_unparseable_goal_only_reads(self):
+        plan = tasks_mod.parse_goal("what is on screen")
+        self.assertEqual([s["tool"] for s in plan["plan"]], ["report"])
+
+
+class TestPolicyRouter(unittest.TestCase):
+    """The tiny router is a word-level classifier saved as JSON, not an LLM."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.path = Path(self.tmp.name) / "policy.json"
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_no_data_means_no_prediction(self):
+        self.assertIsNone(policy_mod.Router(self.path).predict("open firefox"))
+
+    def test_learns_verb_mapping_and_persists(self):
+        r = policy_mod.Router(self.path)
+        for _ in range(8):
+            r.observe("start firefox now", "open", True)
+            r.observe("visit example.com", "goto", True)
+        best, prob = r.predict("start firefox")
+        self.assertEqual(best, "open")
+        self.assertGreater(prob, 0.5)
+        again = policy_mod.Router(self.path)
+        self.assertEqual(again.predict("start firefox")[0], "open")
+        self.assertGreater(again.status()["bytes"], 0)
+        self.assertLess(again.status()["bytes"], 200_000)  # stays tiny
+
+    def test_failed_task_does_not_reinforce_its_template(self):
+        r = policy_mod.Router(self.path)
+        for _ in range(8):
+            r.observe("open firefox", "goto", False)
+        best, _ = r.predict("open firefox")
+        self.assertNotEqual(best, "goto")
+
+
+class TestTaskQueue(unittest.TestCase):
+    """One worker, arrival order, no overlap; results are one small report."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.memory = memory_mod.Memory(path=Path(self.tmp.name) / "m.db")
+        self.calls = []
+        self.lock = threading.Lock()
+
+        def slow(tag: str = "") -> dict:
+            start = time.time()
+            time.sleep(0.25)
+            with self.lock:
+                self.calls.append((tag, start, time.time()))
+            return {"ok": True, "tag": tag}
+
+        def list_windows() -> dict:
+            return {"windows": [{"id": "0x1", "title": "Example", "active": True}]}
+
+        def read_window(window_id: str, raise_first: bool = True) -> dict:
+            return {"ok": True, "lines": [{"x": "Hello"}, {"x": "World"}]}
+
+        self.registry = {"slow": slow, "list_windows": list_windows,
+                         "read_window": read_window}
+        self.runner = tasks_mod.Runner(self.registry, self.memory,
+                                       router=policy_mod.Router(Path(self.tmp.name) / "p.json"))
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_two_tasks_serialize_in_arrival_order(self):
+        out = {}
+
+        def go(tag):
+            out[tag] = self.runner.submit(tag, [{"tool": "slow", "args": {"tag": tag}}], "custom")
+
+        a = threading.Thread(target=go, args=("first",))
+        a.start()
+        time.sleep(0.05)
+        b = threading.Thread(target=go, args=("second",))
+        b.start()
+        a.join(5)
+        b.join(5)
+        self.assertTrue(out["first"]["ok"] and out["second"]["ok"])
+        order = sorted(self.calls, key=lambda c: c[1])
+        self.assertEqual([c[0] for c in order], ["first", "second"])
+        self.assertGreaterEqual(order[1][1], order[0][2])  # no overlap
+
+    def test_report_step_returns_window_text(self):
+        result = self.runner.submit("read it", [{"tool": "report", "args": {}}], "custom")
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["answer"]["window"], "Example")
+        self.assertEqual(result["answer"]["text"], ["Hello", "World"])
+
+    def test_failed_step_stops_the_plan_with_its_own_error(self):
+        result = self.runner.submit("x", [{"tool": "slow", "args": {"tag": "a"}},
+                                          {"tool": "nope", "args": {}}], "custom")
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["failed_at"], "nope")
+        self.assertIn("unknown step", result["error"])
+
+    def test_successful_task_is_saved_and_replayed(self):
+        self.runner.submit("open the example page", [{"tool": "slow", "args": {"tag": "a"}}], "open")
+        found = tasks_mod.learned_plan(self.memory, "open the example page")
+        self.assertIsNotNone(found)
+        name, plan = found
+        self.assertEqual(plan[0]["tool"], "slow")
+        self.assertEqual(self.memory.skill(name)["description"],
+                         "task:open the example page")
+        self.assertIsNone(tasks_mod.learned_plan(self.memory, "something else entirely"))
 
 
 if __name__ == "__main__":
